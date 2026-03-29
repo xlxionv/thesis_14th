@@ -66,6 +66,13 @@ class Runner(object):
         self.use_eval = self.all_args.use_eval
         self.eval_interval = self.all_args.eval_interval
         self.log_interval = self.all_args.log_interval
+        self.debug_daily_report = bool(
+            getattr(self.all_args, "debug_daily_report", False)
+        )
+        self.debug_report_interval = int(
+            getattr(self.all_args, "debug_report_interval", 1)
+        )
+        self._debug_report_count = 0
 
         # dir
         self.model_dir = self.all_args.model_dir

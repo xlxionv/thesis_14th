@@ -123,8 +123,19 @@ def _auto_fill_bosch_config(cfg, seed=1):
     # Production cost matrix
     if cfg.get("production_cost_matrix") is None:
         base = rng.uniform(0.9, 1.4, size=num_products)
-        line_factor = rng.uniform(0.95, 1.15, size=num_lines)
-        mat = np.outer(line_factor, base)
+        line_factor = np.array(
+            cfg.get("line_cost_factor")
+            or rng.uniform(0.95, 1.15, size=num_lines),
+            dtype=np.float32,
+        )
+        proc = np.array(cfg.get("processing_time_matrix"), dtype=np.float32)
+        if proc is None or proc.shape != (num_lines, num_products):
+            mat = np.outer(line_factor, base)
+        else:
+            mean_proc = np.mean(np.where(proc > 0.0, proc, np.nan), axis=0)
+            mean_proc = np.where(np.isfinite(mean_proc), mean_proc, 1.0)
+            scale = np.where(proc > 0.0, proc / mean_proc, 1.0)
+            mat = (np.outer(line_factor, base) * scale)
         mat += rng.normal(0.0, 0.05, size=mat.shape)
         mat = np.clip(mat, 0.6, 2.5)
         cfg["production_cost_matrix"] = mat.round(3).tolist()
@@ -278,6 +289,142 @@ def _auto_fill_bosch_config(cfg, seed=1):
     return cfg, filled
 
 
+def _validate_bosch_config(cfg):
+    warnings = []
+
+    num_lines = int(cfg.get("num_lines", 0))
+    num_products = int(cfg.get("num_products", 0))
+    num_periods = int(cfg.get("num_periods", 0))
+
+    # Horizon vs lookahead
+    lookahead = cfg.get("lookahead_days")
+    horizon = cfg.get("manager_max_horizon")
+    if lookahead is not None and horizon is not None and horizon > lookahead:
+        warnings.append(
+            f"manager_max_horizon ({horizon}) > lookahead_days ({lookahead})"
+        )
+
+    # PM vs CM cost/time sanity
+    pm_cost = cfg.get("pm_cost")
+    cm_cost = cfg.get("cm_cost")
+    pm_time = cfg.get("pm_time")
+    cm_time = cfg.get("cm_time")
+    if pm_cost is not None and cm_cost is not None:
+        for i, (pm, cm) in enumerate(zip(pm_cost, cm_cost)):
+            if pm >= cm:
+                warnings.append(
+                    f"pm_cost[{i}] >= cm_cost[{i}] (pm={pm}, cm={cm})"
+                )
+    if pm_time is not None and cm_time is not None:
+        for i, (pm, cm) in enumerate(zip(pm_time, cm_time)):
+            if pm >= cm:
+                warnings.append(
+                    f"pm_time[{i}] >= cm_time[{i}] (pm={pm}, cm={cm})"
+                )
+
+    # First setup vs max changeover
+    setup_time = cfg.get("setup_time_matrix")
+    first_setup_time = cfg.get("first_setup_time")
+    if setup_time is not None and first_setup_time is not None:
+        mat = np.array(setup_time, dtype=np.float32)
+        max_offdiag = 0.0
+        for l in range(mat.shape[0]):
+            for i in range(mat.shape[1]):
+                for j in range(mat.shape[2]):
+                    if i != j:
+                        max_offdiag = max(max_offdiag, float(mat[l, i, j]))
+        for i, fst in enumerate(first_setup_time):
+            if fst > max_offdiag and max_offdiag > 0.0:
+                warnings.append(
+                    f"first_setup_time[{i}] ({fst}) > max_setup_time ({max_offdiag})"
+                )
+
+    setup_cost = cfg.get("setup_cost_matrix")
+    first_setup_cost = cfg.get("first_setup_cost")
+    if setup_cost is not None and first_setup_cost is not None:
+        mat = np.array(setup_cost, dtype=np.float32)
+        max_offdiag = 0.0
+        for l in range(mat.shape[0]):
+            for i in range(mat.shape[1]):
+                for j in range(mat.shape[2]):
+                    if i != j:
+                        max_offdiag = max(max_offdiag, float(mat[l, i, j]))
+        for i, fsc in enumerate(first_setup_cost):
+            if fsc > max_offdiag and max_offdiag > 0.0:
+                warnings.append(
+                    f"first_setup_cost[{i}] ({fsc}) > max_setup_cost ({max_offdiag})"
+                )
+
+    # Processing time vs production cost correlation (heuristic)
+    proc = cfg.get("processing_time_matrix")
+    prod_cost = cfg.get("production_cost_matrix")
+    if proc is not None and prod_cost is not None:
+        try:
+            pt = np.array(proc, dtype=np.float32)
+            pc = np.array(prod_cost, dtype=np.float32)
+            mask = (pt > 0.0) & (pc > 0.0)
+            if np.any(mask):
+                x = pt[mask].flatten()
+                y = pc[mask].flatten()
+                if x.size > 3:
+                    if np.std(x) > 1e-8 and np.std(y) > 1e-8:
+                        corr = np.corrcoef(x, y)[0, 1]
+                        if np.isfinite(corr) and corr < -0.2:
+                            warnings.append(
+                                f"production_cost_matrix negatively correlated with "
+                                f"processing_time (corr={corr:.2f})"
+                            )
+        except Exception:
+            pass
+
+    return warnings
+
+
+def _cap_infeasible_demand(cfg):
+    demand_profile = cfg.get("demand_profile")
+    eligibility = cfg.get("eligibility_matrix")
+    proc = cfg.get("processing_time_matrix")
+    cap = cfg.get("capacity_per_line")
+    if (
+        demand_profile is None
+        or eligibility is None
+        or proc is None
+        or cap is None
+    ):
+        return []
+
+    try:
+        demand = np.array(demand_profile, dtype=np.float32)
+        elig = np.array(eligibility, dtype=np.float32)
+        pt = np.array(proc, dtype=np.float32)
+        cap_arr = np.array(cap, dtype=np.float32)
+        if demand.ndim != 2 or elig.ndim != 2 or pt.ndim != 2:
+            return []
+        if elig.shape != pt.shape:
+            return []
+
+        num_products = demand.shape[1]
+        cap_units = np.zeros(num_products, dtype=np.float32)
+        for p in range(num_products):
+            mask = (elig[:, p] > 0.5) & (pt[:, p] > 0.0)
+            if np.any(mask):
+                cap_units[p] = float(np.sum(cap_arr[mask] / pt[mask, p]))
+
+        adjustments = []
+        for t in range(demand.shape[0]):
+            for p in range(num_products):
+                if cap_units[p] > 0.0 and demand[t, p] > cap_units[p]:
+                    old = float(demand[t, p])
+                    demand[t, p] = cap_units[p]
+                    adjustments.append((t, p, old, float(cap_units[p])))
+
+        if adjustments:
+            cfg["demand_profile"] = demand.round().astype(int).tolist()
+        return adjustments
+    except Exception:
+        return []
+
+
 def make_train_env(all_args):
     def get_env_fn(rank):
         def init_env():
@@ -346,9 +493,27 @@ def parse_args(args, parser):
         default=7,
         help="Max number of days of demand to cover per line (manager action).",
     )
+    parser.add_argument(
+        "--debug_daily_report",
+        action="store_true",
+        default=False,
+        help="Print per-period capacity/assignment/backlog report for env 0.",
+    )
+    parser.add_argument(
+        "--debug_report_interval",
+        type=int,
+        default=1,
+        help="Print debug report every N periods.",
+    )
 
     parser.add_argument("--holding_cost", type=float, default=1.0)
     parser.add_argument("--backlog_cost", type=float, default=10.0)
+    parser.add_argument(
+        "--per_product_backlog_penalty",
+        type=float,
+        default=500.0,
+        help="Flat penalty added per product that has any backlog.",
+    )
     parser.add_argument("--production_cost", type=float, default=1.0)
     parser.add_argument("--setup_cost", type=float, default=2.0)
     parser.add_argument(
@@ -553,6 +718,23 @@ def parse_args(args, parser):
         if config_path:
             _save_bosch_config(config_path, cfg)
             print(f"[BOSCH config] Wrote filled config to: {config_path}")
+    if cfg:
+        if cfg.get("cap_infeasible_demand"):
+            adjustments = _cap_infeasible_demand(cfg)
+            if adjustments:
+                codes = cfg.get("product_codes", [])
+                print("[BOSCH config] Capped infeasible demand entries:")
+                for t, p, old, capv in adjustments:
+                    code = codes[p] if isinstance(codes, list) and p < len(codes) else str(p)
+                    print(f"  period {t+1} product {code}: {old:.0f} -> {capv:.0f}")
+                if config_path:
+                    _save_bosch_config(config_path, cfg)
+                    print(f"[BOSCH config] Wrote capped demand to: {config_path}")
+        sanity_warnings = _validate_bosch_config(cfg)
+        if sanity_warnings:
+            print("[BOSCH config] Sanity warnings:")
+            for msg in sanity_warnings:
+                print(f"  - {msg}")
     if cfg:
         known_dests = {action.dest for action in parser._actions}
         parser.set_defaults(**{k: v for k, v in cfg.items() if k in known_dests})

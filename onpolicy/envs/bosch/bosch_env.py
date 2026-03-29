@@ -46,6 +46,9 @@ class BoschEnv(object):
         # Cost parameters
         self.holding_cost = float(getattr(args, "holding_cost", 1.0))
         self.backlog_cost = float(getattr(args, "backlog_cost", 10.0))
+        self.per_product_backlog_penalty = float(
+            getattr(args, "per_product_backlog_penalty", 500.0)
+        )
         self.production_cost = float(getattr(args, "production_cost", 1.0))
         self.setup_cost = float(getattr(args, "setup_cost", 2.0))
         self.pm_cost = self._get_array_arg(
@@ -55,6 +58,10 @@ class BoschEnv(object):
             args, "cm_cost", self.num_lines, default=40.0
         )
         self.alpha_cost_weight = float(getattr(args, "alpha_cost_weight", 0.1))
+
+        # Optional metadata for reporting
+        self.product_codes = getattr(args, "product_codes", None)
+        self.line_codes = getattr(args, "line_codes", None)
 
         # Per-line hazard-rate style degradation (scalar or list)
         self.hazard_rate = self._get_array_arg(
@@ -168,7 +175,9 @@ class BoschEnv(object):
         #  line_availability (L),
         #  line_setup (L one-hot over products, flattened),
         #  ages (L),
-        #  local_line_id_one_hot (L)]
+        #  local_line_id_one_hot (L),
+        #  line_contention (L) [manager only; machines see zeros],
+        #  product_urgency (P) [manager only; machines see zeros]]
         self.lookahead_days = int(getattr(args, "lookahead_days", 5))
         self.obs_dim = (
             2 * self.num_products
@@ -182,6 +191,8 @@ class BoschEnv(object):
             + self.num_lines * self.num_products
             + self.num_lines
             + self.num_lines
+            + self.num_lines
+            + self.num_products
         )
 
         high = np.full(self.obs_dim, np.inf, dtype=np.float32)
@@ -380,12 +391,27 @@ class BoschEnv(object):
                     info["period_manager_horizon_mean"] = float(
                         np.mean(self.last_manager_horizons)
                     )
+                    info["period_index"] = int(self.last_period_index)
+                    info["period_capacity_per_product"] = (
+                        self.last_capacity_per_product.copy()
+                    )
+                    info["period_assigned_lines_per_product"] = (
+                        self.last_assigned_lines_per_product.copy()
+                    )
+                    info["period_unmet_demand_per_product"] = (
+                        self.last_unmet_demand_per_product.copy()
+                    )
+                    if self.product_codes is not None:
+                        info["period_product_codes"] = list(self.product_codes)
+                    if self.line_codes is not None:
+                        info["period_line_codes"] = list(self.line_codes)
                     info["period_queue_avg_per_line"] = self.last_queue_avg_per_line.copy()
                     info["period_backlog_per_product"] = self.last_backlog_per_product.copy()
                     info["period_inventory_per_product"] = self.last_inventory_per_product.copy()
                     info["period_prod_cost"] = float(self.last_prod_cost)
                     info["period_prod_cost_per_line"] = self.last_prod_cost_per_line.copy()
                     info["period_setup_cost"] = float(self.last_setup_cost)
+                    info["period_setup_cost_per_line"] = self.last_setup_cost_per_line.copy()
                     info["period_pm_cost"] = float(self.last_pm_cost)
                     info["period_cm_cost"] = float(self.last_cm_cost)
                     info["period_utilization"] = float(self.last_utilization_total)
@@ -450,12 +476,24 @@ class BoschEnv(object):
         self.last_inv_qty = 0.0
         self.last_backlog_qty = 0.0
         self.last_manager_horizons = np.zeros(self.num_lines, dtype=np.float32)
+        self.last_manager_products = np.full(self.num_lines, -1, dtype=np.int32)
+        self.last_capacity_per_product = np.zeros(
+            self.num_products, dtype=np.float32
+        )
+        self.last_assigned_lines_per_product = np.zeros(
+            self.num_products, dtype=np.float32
+        )
+        self.last_unmet_demand_per_product = np.zeros(
+            self.num_products, dtype=np.float32
+        )
+        self.last_period_index = 0
         self.last_queue_avg_per_line = np.zeros(self.num_lines, dtype=np.float32)
         self.last_backlog_per_product = np.zeros(self.num_products, dtype=np.float32)
         self.last_inventory_per_product = np.zeros(self.num_products, dtype=np.float32)
         self.last_prod_cost = 0.0
         self.last_prod_cost_per_line = np.zeros(self.num_lines, dtype=np.float32)
         self.last_setup_cost = 0.0
+        self.last_setup_cost_per_line = np.zeros(self.num_lines, dtype=np.float32)
         self.last_pm_cost = 0.0
         self.last_cm_cost = 0.0
         self.last_utilization_total = 0.0
@@ -481,6 +519,7 @@ class BoschEnv(object):
         # Decode agent 0 action (product + horizon per line)
         products, horizons = self._decode_agent0_action(actions_env[0])
         self.last_manager_horizons = horizons.astype(np.float32).copy()
+        self.last_manager_products = products.astype(np.int32).copy()
 
         # Add allocated lots into each line's queue based on demand horizon.
         # Backlog is shared across lines choosing the same product and
@@ -534,7 +573,7 @@ class BoschEnv(object):
             backlog_share = float(self.backlog[prod_idx]) * share_ratio
             inventory_share = float(self.inventory[prod_idx]) * share_ratio
 
-            target_total_needed = demand_sum + backlog_share
+            target_total_needed = demand_sum * share_ratio + backlog_share
 
             # Already in progress for this line/product
             already_in_progress = float(self.queue[line_idx, prod_idx])
@@ -788,6 +827,8 @@ class BoschEnv(object):
         Compute per-period costs and rewards, update inventory/backlog,
         and return a reward vector of length num_agents for this day.
         """
+        self.last_period_index = self.period_index
+
         # Inventory / backlog cost update based on total production this period.
         inv_cost, backlog_cost = self._update_inventory_and_backlog(
             self.period_produced_per_product
@@ -798,6 +839,37 @@ class BoschEnv(object):
         self.last_backlog_qty = float(np.sum(self.backlog))
         self.last_backlog_per_product = self.backlog.astype(np.float32).copy()
         self.last_inventory_per_product = self.inventory.astype(np.float32).copy()
+        self.last_unmet_demand_per_product = self.backlog.astype(np.float32).copy()
+
+        # Eligible capacity per product (units per period)
+        cap_units = np.zeros(self.num_products, dtype=np.float32)
+        for p in range(self.num_products):
+            mask = (self.line_eligibility[:, p] > 0.5) & (
+                self.processing_time_matrix[:, p] > 0.0
+            )
+            if np.any(mask):
+                cap_units[p] = float(
+                    np.sum(
+                        self.capacity_per_line[mask]
+                        / self.processing_time_matrix[mask, p]
+                    )
+                )
+        self.last_capacity_per_product = cap_units
+
+        # Assigned lines per product (based on manager action for this period)
+        assigned = np.zeros(self.num_products, dtype=np.float32)
+        for line_idx in range(self.num_lines):
+            prod_idx = int(self.last_manager_products[line_idx])
+            if (
+                prod_idx < 0
+                or prod_idx >= self.num_products
+                or self.last_manager_horizons[line_idx] <= 0
+            ):
+                continue
+            if self.line_eligibility[line_idx, prod_idx] < 0.5:
+                continue
+            assigned[prod_idx] += 1.0
+        self.last_assigned_lines_per_product = assigned
 
         if self.period_queue_steps > 0:
             self.last_queue_avg_per_line = (
@@ -840,6 +912,7 @@ class BoschEnv(object):
         self.last_prod_cost = prod_cost_total
         self.last_prod_cost_per_line = prod_cost_per_line
         self.last_setup_cost = setup_cost_total
+        self.last_setup_cost_per_line = self.period_setup_costs.astype(np.float32).copy()
         self.last_pm_cost = pm_cost_total
         self.last_cm_cost = expected_cm_cost_total
         self.last_utilization_per_line = util_per_line
@@ -857,9 +930,29 @@ class BoschEnv(object):
         )
 
         # --- 3. MACHINE REWARD ---
+        total_responsibility = float(
+            np.sum(self.period_produced_per_line) + np.sum(self.queue)
+        )
         for line_idx in range(self.num_lines):
-            rewards[1 + line_idx, 0] = self.alpha_cost_weight * (
-                -float(manager_direct_costs)
+            line_responsibility = float(
+                np.sum(self.period_produced_per_line[line_idx])
+                + np.sum(self.queue[line_idx])
+            )
+            if total_responsibility > 0.0:
+                share = line_responsibility / total_responsibility
+            else:
+                share = 1.0 / float(self.num_lines)
+
+            line_service_cost = share * float(inv_cost + backlog_cost)
+            line_prod_cost = float(
+                np.sum(
+                    self.period_produced_per_line[line_idx]
+                    * self.production_cost_matrix[line_idx]
+                )
+            )
+
+            rewards[1 + line_idx, 0] = -self.alpha_cost_weight * (
+                line_service_cost + line_prod_cost
             )
 
         return rewards
@@ -885,6 +978,8 @@ class BoschEnv(object):
 
             inv_cost += self.holding_cost * self.inventory[p]
             backlog_cost += self.backlog_cost * self.backlog[p]
+            if self.backlog[p] > 0:
+                backlog_cost += self.per_product_backlog_penalty
 
         return inv_cost, backlog_cost
 
@@ -946,6 +1041,30 @@ class BoschEnv(object):
             target_idx = self.period_index + d
             if target_idx < self.num_periods:
                 demand_window[d] = self.demand[target_idx]
+
+        # Contention: for each line, how many eligible products have demand this period
+        contention = np.zeros(self.num_lines, dtype=np.float32)
+        if self.num_periods > 0:
+            t_idx = min(self.period_index, self.num_periods - 1)
+            for l in range(self.num_lines):
+                competing = 0
+                for p in range(self.num_products):
+                    if (
+                        self.line_eligibility[l, p] > 0.5
+                        and self.demand[t_idx, p] > 0
+                    ):
+                        competing += 1
+                if self.num_products > 0:
+                    contention[l] = float(competing) / float(self.num_products)
+
+        # Urgency: for each product, how soon is the next non-zero demand?
+        urgency = np.zeros(self.num_products, dtype=np.float32)
+        for p in range(self.num_products):
+            for d in range(self.lookahead_days):
+                idx = self.period_index + d
+                if idx < self.num_periods and self.demand[idx, p] > 0:
+                    urgency[p] = 1.0 / float(d + 1)
+                    break
 
         # Line availability = always 1 in this simplified model
         line_availability = np.ones(self.num_lines, dtype=np.float32)
@@ -1038,6 +1157,16 @@ class BoschEnv(object):
                     line_id_oh[line_idx] = 1.0
             vec[pos : pos + self.num_lines] = line_id_oh
             pos += self.num_lines
+
+            # Line contention (manager only; machines get zeros)
+            if agent_id == 0:
+                vec[pos : pos + self.num_lines] = contention
+            pos += self.num_lines
+
+            # Product urgency (manager only; machines get zeros)
+            if agent_id == 0:
+                vec[pos : pos + self.num_products] = urgency
+            pos += self.num_products
 
             obs_all.append(vec)
 

@@ -88,6 +88,7 @@ class MPERunner(Runner):
                 "period_prod_cost": [],
                 "period_prod_cost_per_line": [],
                 "period_setup_cost": [],
+                "period_setup_cost_per_line": [],
                 "period_pm_cost": [],
                 "period_cm_cost": [],
                 "period_utilization": [],
@@ -193,6 +194,16 @@ class MPERunner(Runner):
                         env_infos["period_setup_cost"].append(
                             float(agent0_info["period_setup_cost"])
                         )
+                    if "period_setup_cost_per_line" in agent0_info:
+                        per_line = np.asarray(
+                            agent0_info["period_setup_cost_per_line"], dtype=np.float32
+                        )
+                        for line_idx, val in enumerate(per_line):
+                            key = f"setup_cost_line_{line_idx}"
+                            env_infos.setdefault(key, []).append(float(val))
+                        env_infos["period_setup_cost_per_line"].append(
+                            float(np.mean(per_line))
+                        )
                     if "period_pm_cost" in agent0_info:
                         env_infos["period_pm_cost"].append(
                             float(agent0_info["period_pm_cost"])
@@ -222,6 +233,50 @@ class MPERunner(Runner):
                         env_infos["period_queue_avg"].append(
                             float(np.mean(per_line))
                         )
+
+                    # Optional per-period debug report
+                    if (
+                        self.debug_daily_report
+                        and env_idx == 0
+                        and "period_capacity_per_product" in agent0_info
+                    ):
+                        self._debug_report_count += 1
+                        if self.debug_report_interval < 1:
+                            self.debug_report_interval = 1
+                        if (
+                            (self._debug_report_count - 1)
+                            % self.debug_report_interval
+                            == 0
+                        ):
+                            cap = np.asarray(
+                                agent0_info["period_capacity_per_product"], dtype=np.float32
+                            )
+                            assigned = np.asarray(
+                                agent0_info["period_assigned_lines_per_product"],
+                                dtype=np.float32,
+                            )
+                            unmet = np.asarray(
+                                agent0_info["period_unmet_demand_per_product"],
+                                dtype=np.float32,
+                            )
+                            codes = agent0_info.get("period_product_codes")
+                            if not isinstance(codes, list) or len(codes) != len(cap):
+                                codes = [str(i) for i in range(len(cap))]
+                            period_idx = agent0_info.get(
+                                "period_index", self._debug_report_count - 1
+                            )
+                            # Log per-product debug scalars to TensorBoard
+                            for i, code in enumerate(codes):
+                                safe_code = str(code).replace(" ", "_")
+                                env_infos.setdefault(f"cap_prod_{safe_code}", []).append(
+                                    float(cap[i])
+                                )
+                                env_infos.setdefault(
+                                    f"assigned_lines_prod_{safe_code}", []
+                                ).append(float(assigned[i]))
+                                env_infos.setdefault(
+                                    f"unmet_demand_prod_{safe_code}", []
+                                ).append(float(unmet[i]))
 
                 data = obs, rewards, dones, infos, available_actions, active_masks, values, actions, action_log_probs, rnn_states, rnn_states_critic 
                 
