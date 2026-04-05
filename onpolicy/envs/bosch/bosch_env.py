@@ -432,10 +432,16 @@ class BoschEnv(object):
         """
         if hasattr(self, "demand_profile"):
             self.demand = self.demand_profile.astype(np.float32).copy()
+            self.avg_demand_per_product = np.mean(self.demand, axis=0).astype(
+                np.float32
+            )
             return
 
         base_demand = self.mean_demand.astype(np.float32)
         self.demand = np.tile(base_demand[None, :], (self.num_periods, 1))
+        self.avg_demand_per_product = np.mean(self.demand, axis=0).astype(
+            np.float32
+        )
 
     def _reset_state(self):
         # Episode-level counters
@@ -981,7 +987,11 @@ class BoschEnv(object):
             inv_costs[p] = self.holding_cost * self.inventory[p]
             backlog_costs[p] = self.backlog_cost * self.backlog[p]
             if self.backlog[p] > 0:
-                backlog_costs[p] += self.per_product_backlog_penalty
+                avg_ref = float(getattr(self, "avg_demand_per_product", period_demand)[p])
+                demand_ref = max(1.0, float(period_demand[p]), avg_ref)
+                backlog_costs[p] += self.per_product_backlog_penalty * (
+                    float(self.backlog[p]) / demand_ref
+                )
 
         self.last_product_service_costs = inv_costs + backlog_costs
         inv_cost = float(np.sum(inv_costs))
