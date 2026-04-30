@@ -927,6 +927,10 @@ def main(args):
     from onpolicy.runner.separated.mpe_runner import MPERunner as Runner
 
     runner = Runner(config)
+    
+    if runner.model_dir is not None:
+        runner.restore()
+
     runner.run()
 
     # cleanup

@@ -141,8 +141,8 @@ class Runner(object):
             for agent_id in range(self.num_agents):
                 self.policy.append(_make_policy(agent_id))
 
-        if self.model_dir is not None:
-            self.restore()
+        # if self.model_dir is not None:
+        #    self.restore()
 
         self.trainer = []
         self.buffer = []
