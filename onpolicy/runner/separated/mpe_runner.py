@@ -107,6 +107,8 @@ class MPERunner(Runner):
                 "period_backlog_per_product": [],
                 "period_inventory_per_product": [],
             }
+            # Accumulators for episode-level costs: [Backlog, Inventory, Maintenance, Production, Setup, TOTAL]
+            accumulated_costs = np.zeros((self.n_rollout_threads, 6), dtype=np.float32)
             if self.use_linear_lr_decay:
                 decayed = set()
                 for agent_id in range(self.num_agents):
@@ -236,6 +238,22 @@ class MPERunner(Runner):
                         env_infos["period_total_cost"].append(
                             float(agent0_info["period_total_cost"])
                         )
+                    
+                    # Update episode-level accumulators
+                    if "period_backlog_cost" in agent0_info:
+                        accumulated_costs[env_idx, 0] += float(agent0_info["period_backlog_cost"])
+                    if "period_inv_cost" in agent0_info:
+                        accumulated_costs[env_idx, 1] += float(agent0_info["period_inv_cost"])
+                    if "period_pm_cost" in agent0_info or "period_cm_cost" in agent0_info:
+                        m_cost = float(agent0_info.get("period_pm_cost", 0.0)) + \
+                                 float(agent0_info.get("period_cm_cost", 0.0))
+                        accumulated_costs[env_idx, 2] += m_cost
+                    if "period_prod_cost" in agent0_info:
+                        accumulated_costs[env_idx, 3] += float(agent0_info["period_prod_cost"])
+                    if "period_setup_cost" in agent0_info:
+                        accumulated_costs[env_idx, 4] += float(agent0_info["period_setup_cost"])
+                    if "period_total_cost" in agent0_info:
+                        accumulated_costs[env_idx, 5] += float(agent0_info["period_total_cost"])
                     if "episode_total_cost" in agent0_info:
                         env_infos["episode_total_cost"].append(
                             float(agent0_info["episode_total_cost"])
@@ -360,6 +378,14 @@ class MPERunner(Runner):
                 )
                 total_reward_per_env += ep_rewards
             env_infos["episode_reward_total"] = [float(np.mean(total_reward_per_env))]
+            
+            # Log accumulated episode costs (mean over threads)
+            env_infos["episode_costs/Backlog"] = accumulated_costs[:, 0].tolist()
+            env_infos["episode_costs/Inventory"] = accumulated_costs[:, 1].tolist()
+            env_infos["episode_costs/Maintenance"] = accumulated_costs[:, 2].tolist()
+            env_infos["episode_costs/Production"] = accumulated_costs[:, 3].tolist()
+            env_infos["episode_costs/Setup"] = accumulated_costs[:, 4].tolist()
+            env_infos["episode_costs/TOTAL"] = accumulated_costs[:, 5].tolist()
             
             # post process
             total_num_steps = (episode + 1) * self.episode_length * self.n_rollout_threads
