@@ -93,6 +93,7 @@ class MPERunner(Runner):
                 "period_inv_qty": [],
                 "period_backlog_qty": [],
                 "period_manager_horizon_mean": [],
+                "period_manager_activated_mean": [],
                 "period_queue_avg": [],
                 "period_prod_cost": [],
                 "period_prod_cost_per_line": [],
@@ -101,6 +102,8 @@ class MPERunner(Runner):
                 "period_pm_cost": [],
                 "period_cm_cost": [],
                 "period_utilization": [],
+                "period_total_cost": [],
+                "episode_total_cost": [],
                 "period_backlog_per_product": [],
                 "period_inventory_per_product": [],
             }
@@ -157,6 +160,10 @@ class MPERunner(Runner):
                         for line_idx, val in enumerate(per_line):
                             key = f"horizon_line_{line_idx}"
                             env_infos.setdefault(key, []).append(float(val))
+                    if "period_manager_activated_mean" in agent0_info:
+                        env_infos["period_manager_activated_mean"].append(
+                            float(agent0_info["period_manager_activated_mean"])
+                        )
                     if "period_inv_qty" in agent0_info:
                         env_infos["period_inv_qty"].append(
                             float(agent0_info["period_inv_qty"])
@@ -224,6 +231,14 @@ class MPERunner(Runner):
                     if "period_utilization" in agent0_info:
                         env_infos["period_utilization"].append(
                             float(agent0_info["period_utilization"])
+                        )
+                    if "period_total_cost" in agent0_info:
+                        env_infos["period_total_cost"].append(
+                            float(agent0_info["period_total_cost"])
+                        )
+                    if "episode_total_cost" in agent0_info:
+                        env_infos["episode_total_cost"].append(
+                            float(agent0_info["episode_total_cost"])
                         )
                     if "period_utilization_per_line" in agent0_info:
                         per_line = np.asarray(

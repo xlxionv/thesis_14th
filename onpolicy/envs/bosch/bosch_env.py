@@ -98,6 +98,14 @@ class BoschEnv(object):
         self.dense_setup_penalty = float(getattr(args, "dense_setup_penalty", 1.0))
         self.dense_pm_penalty = float(getattr(args, "dense_pm_penalty", 1.0))
 
+        # Heuristic allocator config
+        self.allocator_lookahead = int(
+            getattr(args, "allocator_lookahead", 0)
+        )
+        self.activation_penalty = float(
+            getattr(args, "activation_penalty", 0.0)
+        )
+
         # Per-product processing times and mean demand (kept for compatibility)
         self.processing_time = self._get_array_arg(
             args, "processing_time", self.num_products, default=1.0
@@ -228,16 +236,9 @@ class BoschEnv(object):
         ]
 
         # Action spaces
-        # Agent 0: MultiDiscrete per line:
-        #   (primary_product, horizon_days, secondary_product)
-        # primary_product  in [0, num_products-1]
-        # horizon_days     in [0, manager_max_horizon]
-        # secondary_product in [0, num_products]  (num_products = "none")
-        lot_dims = []
-        for _ in range(self.num_lines):
-            lot_dims.append([0, self.num_products - 1])   # primary product
-            lot_dims.append([0, self.manager_max_horizon]) # horizon
-            lot_dims.append([0, self.num_products])        # secondary product (P = none)
+        # Agent 0: MultiBinary via MultiDiscrete [0,1] per (line, product).
+        # Each binary dimension = "activate product p on line l this period?"
+        lot_dims = [[0, 1]] * (self.num_lines * self.num_products)
         agent0_act = MultiDiscrete(lot_dims)
 
         # Machine agents: Discrete
@@ -252,6 +253,11 @@ class BoschEnv(object):
         self.rng = np.random.RandomState(getattr(args, "seed", 1))
 
         self._build_demand_profile()
+
+        # Default allocator_lookahead to lookahead_days if not set
+        if self.allocator_lookahead <= 0:
+            self.allocator_lookahead = self.lookahead_days
+
         self._reset_state()
 
     def _get_array_arg(self, args, name, length, default):
@@ -412,6 +418,10 @@ class BoschEnv(object):
                     info["period_manager_horizon_mean"] = float(
                         np.mean(self.last_manager_horizons)
                     )
+                    info["period_manager_activated_mean"] = float(
+                        np.sum(self.last_manager_masks)
+                        / max(1, self.num_lines)
+                    )
                     info["period_index"] = int(self.last_period_index)
                     info["period_capacity_per_product"] = (
                         self.last_capacity_per_product.copy()
@@ -437,6 +447,18 @@ class BoschEnv(object):
                     info["period_cm_cost"] = float(self.last_cm_cost)
                     info["period_utilization"] = float(self.last_utilization_total)
                     info["period_utilization_per_line"] = self.last_utilization_per_line.copy()
+                    # RH2-compatible total cost = inv + backlog + prod + setup + pm + cm
+                    period_total = (
+                        float(self.last_inv_cost)
+                        + float(self.last_backlog_cost)
+                        + float(self.last_prod_cost)
+                        + float(self.last_setup_cost)
+                        + float(self.last_pm_cost)
+                        + float(self.last_cm_cost)
+                    )
+                    info["period_total_cost"] = period_total
+                    self.episode_total_cost += period_total
+                    info["episode_total_cost"] = float(self.episode_total_cost)
             else:
                 # Machine agents are inactive on manager micro-steps.
                 info["machine_active"] = 0.0 if is_manager_step else 1.0
@@ -507,6 +529,10 @@ class BoschEnv(object):
         self.last_backlog_qty = 0.0
         self.last_manager_horizons = np.zeros(self.num_lines, dtype=np.float32)
         self.last_manager_products = np.full(self.num_lines, -1, dtype=np.int32)
+        self.last_manager_masks = np.zeros(
+            (self.num_lines, self.num_products), dtype=np.float32
+        )
+        self.episode_total_cost = 0.0  # cumulative RH2-style total cost
         self.last_capacity_per_product = np.zeros(
             self.num_products, dtype=np.float32
         )
@@ -547,227 +573,136 @@ class BoschEnv(object):
 
     def _manager_step(self, actions_env):
         """
-        Agent 0 chooses lot allocations once per period.
-
-        The manager selects a primary (product, horizon) and an optional
-        secondary product per line.  Primary allocation fills the queue
-        based on demand and net requirements.  The secondary pass fills
-        remaining line capacity with the secondary product, enabling
-        cross-scheduling (e.g. Line 2 produces P097 then P100).
+        Agent 0 outputs binary activation masks via MultiDiscrete [0,1].
+        A fast heuristic allocator determines quantities and fills queues.
         """
-        # Decode agent 0 action (primary product, horizon, secondary product)
-        products, horizons, secondary_products = self._decode_agent0_action(
-            actions_env[0]
+        # Decode binary masks from agent 0 action
+        masks = self._decode_agent0_action(actions_env[0])
+
+        # Apply eligibility filter
+        masks = masks * self.line_eligibility
+
+        # Store for logging and reward sharing
+        self.last_manager_masks = masks.copy()
+
+        # Backward-compatible tracking
+        self.last_manager_horizons = np.zeros(self.num_lines, dtype=np.float32)
+        self.last_manager_products = np.full(self.num_lines, -1, dtype=np.int32)
+        for l in range(self.num_lines):
+            active_prods = np.where(masks[l] > 0.5)[0]
+            if len(active_prods) > 0:
+                self.last_manager_products[l] = int(active_prods[0])
+                self.last_manager_horizons[l] = float(self.allocator_lookahead)
+
+        # Run heuristic allocator to fill queues
+        queue_additions = self._heuristic_allocate(masks)
+        self.queue += queue_additions
+
+    def _heuristic_allocate(self, masks):
+        """
+        Given binary masks (L x P), fill queues using demand-proportional
+        allocation.
+
+        Two-stage logic:
+          - URGENCY (full lookahead window): determines which products to
+            prioritize and whether pre-building is warranted.
+          - QUANTITY (single-period cap): limits how much to actually queue
+            so we don't overshoot inventory.  The quantity target per product
+            is: today's demand + backlog - inventory - queue,
+            ensuring only ~1 day of production is queued at a time.
+        """
+        L, P = self.num_lines, self.num_products
+        queue_add = np.zeros((L, P), dtype=np.float32)
+
+        t = self.period_index
+
+        # --- URGENCY: full lookahead for priority ranking ---
+        urgency_end = min(t + self.allocator_lookahead, self.num_periods)
+        if urgency_end > t:
+            urgency_demand = np.sum(
+                self.demand[t:urgency_end], axis=0
+            ).astype(np.float32)
+        else:
+            urgency_demand = np.zeros(P, dtype=np.float32)
+
+        urgency = (
+            urgency_demand
+            + self.backlog
+            - self.inventory
+            - np.sum(self.queue, axis=0)
         )
-        self.last_manager_horizons = horizons.astype(np.float32).copy()
-        self.last_manager_products = products.astype(np.int32).copy()
+        urgency = np.maximum(urgency, 0.0).copy()
 
-        # ------------------------------------------------------------------
-        # PRIMARY ALLOCATION (unchanged logic)
-        # ------------------------------------------------------------------
-        # Add allocated lots into each line's queue based on demand horizon.
-        # Backlog is shared across lines choosing the same product and
-        # is split proportionally by each line's horizon demand.
-        lines_by_product = {p: [] for p in range(self.num_products)}
-        demand_by_line = np.zeros(self.num_lines, dtype=np.float32)
-        total_demand_by_product = np.zeros(self.num_products, dtype=np.float32)
-        for line_idx in range(self.num_lines):
-            prod_idx = int(products[line_idx])
-            horizon = int(horizons[line_idx])
-            if horizon <= 0:
-                continue
-            if self.line_eligibility[line_idx, prod_idx] < 0.5:
-                continue
-            start = self.period_index
-            end = min(self.period_index + horizon, self.num_periods)
-            demand_sum = float(np.sum(self.demand[start:end, prod_idx]))
-            if demand_sum <= 0.0 and self.backlog[prod_idx] <= 0.0:
-                continue
-            lines_by_product[prod_idx].append(line_idx)
-            demand_by_line[line_idx] = demand_sum
-            total_demand_by_product[prod_idx] += demand_sum
+        # --- QUANTITY: single-period demand target ---
+        # How much should we actually produce TODAY for each product?
+        # Target = today's demand + backlog - inventory - queue
+        # This prevents overproduction beyond immediate needs while still
+        # allowing pre-building (1-day buffer) when future demand is known.
+        # Use a short quantity horizon (2 periods) to enable pre-building
+        # on zero-demand days without the 5-day overshoot.
+        qty_horizon = min(2, self.allocator_lookahead)
+        qty_end = min(t + qty_horizon, self.num_periods)
+        if qty_end > t:
+            qty_demand = np.sum(
+                self.demand[t:qty_end], axis=0
+            ).astype(np.float32)
+        else:
+            qty_demand = np.zeros(P, dtype=np.float32)
 
-        net_req_by_product = np.zeros(self.num_products, dtype=np.float32)
-        for prod_idx in range(self.num_products):
-            if not lines_by_product[prod_idx]:
-                continue
-            # Credit only queue that is realistically executable under the
-            # currently selected horizons and per-line setup/capacity limits.
-            effective_in_progress = 0.0
-            for line_idx in lines_by_product[prod_idx]:
-                horizon = int(horizons[line_idx])
-                if horizon <= 0:
+        qty_target = (
+            qty_demand
+            + self.backlog
+            - self.inventory
+            - np.sum(self.queue, axis=0)
+        )
+        qty_target = np.maximum(qty_target, 0.0).copy()
+
+        # For each line, allocate activated products up to one-period capacity
+        for l in range(L):
+            remaining_cap = float(self.capacity_per_line[l])
+
+            # Get activated products, sorted by URGENCY (full lookahead)
+            active = []
+            for p in range(P):
+                if masks[l, p] > 0.5:
+                    active.append((p, float(urgency[p])))
+            active.sort(key=lambda x: -x[1])  # most urgent first
+
+            for p, _urg in active:
+                target = float(qty_target[p])
+                if target <= 0.0 or remaining_cap <= 0.0:
                     continue
 
-                proc_time = float(self.processing_time_matrix[line_idx, prod_idx])
-                if proc_time <= 0.0:
+                proc = float(self.processing_time_matrix[l, p])
+                if proc <= 0.0:
                     continue
 
-                setup_time_for_line = 0.0
-                last_prod = int(self.line_setup[line_idx])
-                if last_prod < 0:
-                    setup_time_for_line = float(self.first_setup_time[line_idx])
-                elif last_prod != prod_idx:
-                    setup_time_for_line = float(
-                        self.setup_time_matrix[line_idx, last_prod, prod_idx]
-                    )
+                # Estimate setup time
+                setup_time = self._estimate_setup_time(l, p)
+                cap_after_setup = max(0.0, remaining_cap - setup_time)
+                max_units = cap_after_setup / proc
 
-                cap_hours = float(self.capacity_per_line[line_idx]) * float(horizon)
-                cap_hours = max(0.0, cap_hours - setup_time_for_line)
-                cap_units = cap_hours / proc_time if proc_time > 0.0 else 0.0
-                queued_units = float(self.queue[line_idx, prod_idx])
-                effective_in_progress += min(queued_units, cap_units)
+                qty = min(target, max_units)
+                if qty <= 0.0:
+                    continue
 
-            total_need = (
-                total_demand_by_product[prod_idx]
-                + float(self.backlog[prod_idx])
-                - float(self.inventory[prod_idx])
-                - float(effective_in_progress)
+                queue_add[l, p] = qty
+                remaining_cap -= qty * proc + setup_time
+                qty_target[p] -= qty   # reduce for other lines
+                urgency[p] -= qty      # keep urgency consistent
+
+        return queue_add
+
+    def _estimate_setup_time(self, line_idx, product_idx):
+        """Estimate setup time for switching to a product on a line."""
+        last_prod = int(self.line_setup[line_idx])
+        if last_prod < 0:
+            return float(self.first_setup_time[line_idx])
+        elif last_prod != product_idx:
+            return float(
+                self.setup_time_matrix[line_idx, last_prod, product_idx]
             )
-            net_req_by_product[prod_idx] = max(0.0, total_need)
-
-        # Track how many capacity-hours each line consumes in the primary pass
-        # so the secondary pass knows how much room is left.
-        primary_hours_used = np.zeros(self.num_lines, dtype=np.float32)
-
-        for line_idx in range(self.num_lines):
-            prod_idx = int(products[line_idx])
-            horizon = int(horizons[line_idx])
-
-            if horizon <= 0:
-                continue
-
-            if self.line_eligibility[line_idx, prod_idx] < 0.5:
-                continue
-
-            start = self.period_index
-            end = min(self.period_index + horizon, self.num_periods)
-            demand_sum = float(np.sum(self.demand[start:end, prod_idx]))
-            if demand_sum <= 0.0 and self.backlog[prod_idx] <= 0.0:
-                continue
-
-            assigned_lines = lines_by_product[prod_idx]
-            if not assigned_lines:
-                continue
-
-            if total_demand_by_product[prod_idx] > 0.0:
-                share_ratio = float(
-                    demand_by_line[line_idx] / total_demand_by_product[prod_idx]
-                )
-            else:
-                share_ratio = 1.0 / float(len(assigned_lines))
-
-            # net_req_by_product already subtracts total in-progress queue for this
-            # product across all lines, so do not subtract per-line queue again.
-            net_new_qty = net_req_by_product[prod_idx] * share_ratio
-
-            # Cap by line capacity over the selected horizon (net of setup time).
-            setup_time_for_line = 0.0
-            last_prod = int(self.line_setup[line_idx])
-            if last_prod < 0:
-                setup_time_for_line = float(self.first_setup_time[line_idx])
-            elif last_prod != prod_idx:
-                setup_time_for_line = float(
-                    self.setup_time_matrix[line_idx, last_prod, prod_idx]
-                )
-
-            cap_hours = float(self.capacity_per_line[line_idx]) * float(horizon)
-            proc_time = float(self.processing_time_matrix[line_idx, prod_idx])
-            cap_hours = max(0.0, cap_hours - setup_time_for_line)
-            cap_units = cap_hours / proc_time if proc_time > 0.0 else 0.0
-
-            # Check how full the bucket already is!
-            current_queue = float(self.queue[line_idx, prod_idx])
-            available_cap = max(0.0, cap_units - current_queue)
-
-            # Cap the addition by the ACTUAL remaining space on this line
-            qty_to_add = min(net_new_qty, available_cap)
-
-            if qty_to_add <= 0.0:
-                continue
-
-            self.queue[line_idx, prod_idx] += qty_to_add
-            primary_hours_used[line_idx] += (
-                qty_to_add * proc_time + setup_time_for_line
-            )
-
-        # ------------------------------------------------------------------
-        # SECONDARY ALLOCATION
-        # ------------------------------------------------------------------
-        for line_idx in range(self.num_lines):
-            sec_prod = int(secondary_products[line_idx])
-            # Index == num_products means "none" — skip.
-            if sec_prod >= self.num_products:
-                continue
-            if self.line_eligibility[line_idx, sec_prod] < 0.5:
-                continue
-
-            sec_proc_time = float(
-                self.processing_time_matrix[line_idx, sec_prod]
-            )
-            if sec_proc_time <= 0.0:
-                continue
-
-            primary_prod = int(products[line_idx])
-            horizon = int(horizons[line_idx])
-            
-            # Treat horizon=0 as a 1-day lookahead for the secondary product 
-            # so the secondary product can still function if primary was skipped.
-            effective_horizon = max(1, horizon)
-
-            if horizon > 0 and self.line_eligibility[line_idx, primary_prod] >= 0.5:
-                effective_last_prod = primary_prod
-            else:
-                effective_last_prod = int(self.line_setup[line_idx])
-
-            sec_setup_time = 0.0
-            if effective_last_prod < 0:
-                sec_setup_time = float(self.first_setup_time[line_idx])
-            elif effective_last_prod != sec_prod:
-                sec_setup_time = float(
-                    self.setup_time_matrix[
-                        line_idx, effective_last_prod, sec_prod
-                    ]
-                )
-
-            # FIX 2: Multiply total capacity by the effective horizon!
-            total_cap_hours = float(self.capacity_per_line[line_idx]) * float(effective_horizon)
-            
-            remaining_hours = max(
-                0.0,
-                total_cap_hours
-                - float(primary_hours_used[line_idx])
-                - sec_setup_time,
-            )
-            if remaining_hours <= 0.0:
-                continue
-
-            remaining_units = remaining_hours / sec_proc_time
-
-            # NEW FIX: Prevent Secondary Queue Explosion by checking the existing bucket!
-            current_sec_queue = float(self.queue[line_idx, sec_prod])
-            available_sec_cap = max(0.0, remaining_units - current_sec_queue)
-
-            # FIX 1: Bound the demand sum by the effective horizon!
-            start = self.period_index
-            end = min(self.period_index + effective_horizon, self.num_periods)
-            sec_demand_sum = float(np.sum(self.demand[start:end, sec_prod]))
-
-            sec_need = (
-                sec_demand_sum
-                + float(self.backlog[sec_prod])
-                - float(self.inventory[sec_prod])
-                - float(np.sum(self.queue[:, sec_prod]))
-            )
-            sec_need = max(0.0, sec_need)
-            if sec_need <= 0.0:
-                continue
-
-            qty_to_add = min(available_sec_cap, sec_need)
-            if qty_to_add <= 0.0:
-                continue
-
-            self.queue[line_idx, sec_prod] += qty_to_add
+        return 0.0
 
     def _machines_step(self, actions_env, rewards):
         """
@@ -976,26 +911,16 @@ class BoschEnv(object):
         return mask
 
     def _build_available_actions(self):
-        # Agent 0 uses MultiDiscrete; build a per-dimension mask.
-        # Layout per line: [product (P), horizon (H+1), secondary (P+1)].
+        # Agent 0 uses binary MultiDiscrete [0,1] per (line, product).
+        # Eligibility masking: [1,1] if eligible, [1,0] if not (force off).
         if self.num_lines > 0 and self.num_products > 0:
             masks = []
             for line_idx in range(self.num_lines):
-                # Primary product: eligible products
-                prod_mask = self.line_eligibility[line_idx].astype(np.float32).copy()
-                if np.sum(prod_mask) <= 0.0:
-                    prod_mask[:] = 1.0
-                # Horizon: all horizons always valid
-                horizon_mask = np.ones(self.manager_max_horizon + 1, dtype=np.float32)
-                # Secondary product: eligible products + "none" (index P)
-                sec_mask = np.zeros(self.num_products + 1, dtype=np.float32)
-                sec_mask[:self.num_products] = (
-                    self.line_eligibility[line_idx].astype(np.float32)
-                )
-                sec_mask[self.num_products] = 1.0  # "none" is always valid
-                masks.append(prod_mask)
-                masks.append(horizon_mask)
-                masks.append(sec_mask)
+                for prod_idx in range(self.num_products):
+                    if self.line_eligibility[line_idx, prod_idx] > 0.5:
+                        masks.append(np.array([1.0, 1.0], dtype=np.float32))
+                    else:
+                        masks.append(np.array([1.0, 0.0], dtype=np.float32))
             manager_mask = np.concatenate(masks, axis=0)
         else:
             manager_mask = np.zeros(0, dtype=np.float32)
@@ -1045,19 +970,10 @@ class BoschEnv(object):
                 )
         self.last_capacity_per_product = cap_units
 
-        # Assigned lines per product (based on manager action for this period)
+        # Assigned lines per product (based on manager masks for this period)
         assigned = np.zeros(self.num_products, dtype=np.float32)
-        for line_idx in range(self.num_lines):
-            prod_idx = int(self.last_manager_products[line_idx])
-            if (
-                prod_idx < 0
-                or prod_idx >= self.num_products
-                or self.last_manager_horizons[line_idx] <= 0
-            ):
-                continue
-            if self.line_eligibility[line_idx, prod_idx] < 0.5:
-                continue
-            assigned[prod_idx] += 1.0
+        for p in range(self.num_products):
+            assigned[p] = float(np.sum(self.last_manager_masks[:, p]))
         self.last_assigned_lines_per_product = assigned
 
         if self.period_queue_steps > 0:
@@ -1117,6 +1033,10 @@ class BoschEnv(object):
         rewards[0, 0] = -float(manager_direct_costs) + self.alpha_cost_weight * (
             -float(worker_total_direct_costs)
         )
+        # Activation penalty: discourage activating too many products
+        if self.activation_penalty > 0.0:
+            num_activated = float(np.sum(self.last_manager_masks))
+            rewards[0, 0] -= self.activation_penalty * num_activated
 
         # --- 3. MACHINE REWARD ---
         # Machine agents receive dense, local rewards during _machines_step().
@@ -1144,11 +1064,8 @@ class BoschEnv(object):
                     # Use end-of-period remaining queue as responsibility proxy.
                     weights = np.maximum(self.queue.astype(np.float32), 0.0)
                 else:
-                    # Default: assignment-based (manager choice this period).
-                    for l in range(self.num_lines):
-                        p = int(self.last_manager_products[l])
-                        if 0 <= p < self.num_products and float(self.last_manager_horizons[l]) > 0.0:
-                            weights[l, p] = float(self.last_manager_horizons[l])
+                    # Default: assignment-based (manager masks this period).
+                    weights = self.last_manager_masks.astype(np.float32).copy()
 
                 denom = np.sum(weights, axis=0)  # per product
                 for p in range(self.num_products):
@@ -1201,47 +1118,32 @@ class BoschEnv(object):
 
     def _decode_agent0_action(self, action_vec):
         """
-        Convert concatenated one-hot representation back into per-line
-        (product_index, horizon_days, secondary_product) selections.
+        Convert concatenated one-hot representation back into binary masks
+        for each (line, product) pair.
+        Each binary dim produces a 2-element one-hot: [1,0]=off, [0,1]=on.
         """
         one_hot = np.asarray(action_vec, dtype=np.float32).ravel()
 
-        num_dims = self.num_lines * 3
-        block_sizes = [
-            self.num_products,             # primary product
-            self.manager_max_horizon + 1,  # horizon
-            self.num_products + 1,         # secondary product (P = "none")
-        ]
-
-        expected_len = sum(block_sizes) * self.num_lines
+        expected_len = self.num_lines * self.num_products * 2
 
         if one_hot.size != expected_len:
             raise ValueError(
                 f"Agent 0 action length {one_hot.size} does not match "
                 f"expected {expected_len} for "
-                f"{num_dims} dims."
+                f"{self.num_lines}x{self.num_products} binary mask."
             )
 
-        products = np.zeros(self.num_lines, dtype=np.float32)
-        horizons = np.zeros(self.num_lines, dtype=np.float32)
-        secondary_products = np.zeros(self.num_lines, dtype=np.float32)
-
+        masks = np.zeros(
+            (self.num_lines, self.num_products), dtype=np.float32
+        )
         offset = 0
-        for line_idx in range(self.num_lines):
-            # primary product index
-            seg = one_hot[offset : offset + block_sizes[0]]
-            products[line_idx] = float(int(np.argmax(seg)))
-            offset += block_sizes[0]
-            # horizon days
-            seg = one_hot[offset : offset + block_sizes[1]]
-            horizons[line_idx] = float(int(np.argmax(seg)))
-            offset += block_sizes[1]
-            # secondary product index (num_products = "none")
-            seg = one_hot[offset : offset + block_sizes[2]]
-            secondary_products[line_idx] = float(int(np.argmax(seg)))
-            offset += block_sizes[2]
+        for l in range(self.num_lines):
+            for p in range(self.num_products):
+                seg = one_hot[offset : offset + 2]
+                masks[l, p] = float(np.argmax(seg))
+                offset += 2
 
-        return products, horizons, secondary_products
+        return masks
 
     def _build_observations(self):
         """

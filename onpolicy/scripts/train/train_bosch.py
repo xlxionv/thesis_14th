@@ -661,6 +661,18 @@ def parse_args(args, parser):
         help="Immediate penalty weight for PM cost when PM action is taken.",
     )
     parser.add_argument(
+        "--allocator_lookahead",
+        type=int,
+        default=0,
+        help="Lookahead days for heuristic allocator (0 = use lookahead_days).",
+    )
+    parser.add_argument(
+        "--activation_penalty",
+        type=float,
+        default=0.0,
+        help="Per-activated-slot penalty for manager reward.",
+    )
+    parser.add_argument(
         "--debug_actions",
         action="store_true",
         default=False,
