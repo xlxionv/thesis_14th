@@ -7,6 +7,7 @@ import os
 import numpy as np
 from itertools import chain
 import torch
+import json
 
 from onpolicy.utils.util import update_linear_schedule
 from onpolicy.runner.separated.base_runner import Runner
@@ -86,7 +87,15 @@ class MPERunner(Runner):
         start = time.time()
         episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
 
+        # --- NEW: Dynamically track the exact period and true environment episode ---
+        self.current_periods = np.zeros(self.n_rollout_threads, dtype=int)
+        self.true_env_episodes = np.zeros(self.n_rollout_threads, dtype=int)
+        # ---------------------------------------------------------------------------
+
         for episode in range(episodes):
+            self.current_episode = episode # Store for collect() logic
+            self.total_episodes = episodes
+            
             env_infos = {
                 "period_inv_cost": [],
                 "period_backlog_cost": [],
@@ -125,6 +134,7 @@ class MPERunner(Runner):
                     
                 # Obser reward and next obs
                 obs, rewards, dones, infos = self.envs.step(actions_env)
+                
                 available_actions = self._extract_available_actions_from_infos(
                     infos, self.n_rollout_threads
                 )
@@ -299,9 +309,11 @@ class MPERunner(Runner):
                             ).append(float(unmet[i]))
 
                     # Optional per-period debug report
+                    episode_interval = getattr(self.all_args, "debug_report_episode_interval", 1)
                     if (
                         self.debug_daily_report
                         and env_idx == 0
+                        and self.true_env_episodes[env_idx] % episode_interval == 0
                         and "period_capacity_per_product" in agent0_info
                     ):
                         self._debug_report_count += 1
@@ -323,6 +335,10 @@ class MPERunner(Runner):
                                 agent0_info["period_unmet_demand_per_product"],
                                 dtype=np.float32,
                             )
+                            inv = np.asarray(
+                                agent0_info["period_inventory_per_product"],
+                                dtype=np.float32,
+                            ) if "period_inventory_per_product" in agent0_info else np.zeros_like(cap)
                             codes = agent0_info.get("period_product_codes")
                             if not isinstance(codes, list) or len(codes) != len(cap):
                                 codes = [str(i) for i in range(len(cap))]
@@ -343,25 +359,38 @@ class MPERunner(Runner):
                                 ).append(float(unmet[i]))
 
                             # Also write a text report instead of printing to terminal.
-                            report_lines = [f"period {period_idx}"]
+                            true_ep = self.true_env_episodes[env_idx]
+                            report_lines = [f"episode {true_ep} period {period_idx}"]
                             for i, code in enumerate(codes):
                                 report_lines.append(
-                                    f"{code}: cap={cap[i]:.0f}, assigned={assigned[i]:.0f}, backlog={unmet[i]:.0f}"
+                                    f"{code}: cap={cap[i]:.0f}, assigned={assigned[i]:.0f}, backlog={unmet[i]:.0f}, inventory={inv[i]:.0f}"
                                 )
-                            base_dir = getattr(self, "log_dir", None) or getattr(
-                                self, "save_dir", None
-                            )
-                            if base_dir is not None:
-                                report_path = os.path.join(
-                                    base_dir, "debug_daily_report.txt"
-                                )
-                                with open(report_path, "a", encoding="utf-8") as f:
-                                    f.write("\n".join(report_lines) + "\n")
+                            
+                            report_filename = getattr(self.all_args, "debug_report_file", "schedule_analysis.txt")
+                            if report_filename is None:
+                                report_filename = "schedule_analysis.txt"
+                            
+                            # Use run_dir as the root for reports to avoid burying them in logs/
+                            report_path = os.path.join(str(self.run_dir), report_filename)
+                            
+                            with open(report_path, "a", encoding="utf-8") as f:
+                                f.write("\n".join(report_lines) + "\n")
 
                 data = obs, rewards, dones, infos, available_actions, active_masks, values, actions, action_log_probs, rnn_states, rnn_states_critic 
                 
                 # insert data into buffer
                 self.insert(data)
+
+                # --- NEW: UPDATE THE PERIOD TRACKER (Moved to end of step processing) ---
+                for i in range(self.n_rollout_threads):
+                    if np.all(dones[i]):  
+                        # Environment completely reset, go back to Period 0
+                        self.current_periods[i] = 0
+                        self.true_env_episodes[i] += 1
+                    elif "period_index" in infos[i][0]:  
+                        # A period successfully finished, move to the next period!
+                        self.current_periods[i] += 1
+                # ------------------------------------------------------------------------
 
             # compute return and update network
             self.compute()
@@ -468,23 +497,25 @@ class MPERunner(Runner):
                                                             self.buffer[agent_id].rnn_states_critic[step],
                                                             self.buffer[agent_id].masks[step],
                                                             agent_available_actions)
+
             # [agents, envs, dim]
             values.append(_t2n(value))
-            action = _t2n(action)
-            # rearrange action
+            action_np = _t2n(action)
+            actions.append(action_np)
+            
+            # rearrange action for environment
             if self.envs.action_space[agent_id].__class__.__name__ == 'MultiDiscrete':
                 for i in range(self.envs.action_space[agent_id].shape):
-                    uc_action_env = np.eye(self.envs.action_space[agent_id].high[i]+1)[action[:, i]]
+                    uc_action_env = np.eye(self.envs.action_space[agent_id].high[i]+1)[action_np[:, i]]
                     if i == 0:
                         action_env = uc_action_env
                     else:
                         action_env = np.concatenate((action_env, uc_action_env), axis=1)
             elif self.envs.action_space[agent_id].__class__.__name__ == 'Discrete':
-                action_env = np.squeeze(np.eye(self.envs.action_space[agent_id].n)[action], 1)
+                action_env = np.squeeze(np.eye(self.envs.action_space[agent_id].n)[action_np], 1)
             else:
                 raise NotImplementedError
 
-            actions.append(action)
             temp_actions_env.append(action_env)
             action_log_probs.append(_t2n(action_log_prob))
             rnn_states.append(_t2n(rnn_state))
@@ -497,23 +528,6 @@ class MPERunner(Runner):
             for temp_action_env in temp_actions_env:
                 one_hot_action_env.append(temp_action_env[i])
             actions_env.append(one_hot_action_env)
-
-        if getattr(self.all_args, "debug_actions", False):
-            max_steps = int(getattr(self.all_args, "debug_action_steps", 0))
-            if step < max_steps and self.n_rollout_threads > 0:
-                mgr = actions[0][0]
-                mgr_products = [int(x) for x in mgr[0::2]]
-                mgr_horizons = [int(x) for x in mgr[1::2]]
-                print(
-                    f"[debug] step {step} manager products={mgr_products} horizons={mgr_horizons}"
-                )
-                machine_acts = [
-                    int(actions[agent_id][0][0])
-                    for agent_id in range(1, self.num_agents)
-                ]
-                print(
-                    f"[debug] step {step} machine actions={machine_acts}"
-                )
 
         return values, actions, action_log_probs, rnn_states, rnn_states_critic, actions_env
 
