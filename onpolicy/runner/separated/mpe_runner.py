@@ -370,8 +370,9 @@ class MPERunner(Runner):
                             if report_filename is None:
                                 report_filename = "schedule_analysis.txt"
                             
-                            # Use run_dir as the root for reports to avoid burying them in logs/
-                            report_path = os.path.join(str(self.run_dir), report_filename)
+                            # Use save_dir if run_dir is missing, otherwise save in the current folder
+                            safe_dir = getattr(self, "run_dir", getattr(self, "save_dir", "./"))
+                            report_path = os.path.join(str(safe_dir), report_filename)
                             
                             with open(report_path, "a", encoding="utf-8") as f:
                                 f.write("\n".join(report_lines) + "\n")
