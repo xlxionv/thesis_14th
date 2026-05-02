@@ -6,7 +6,7 @@
   "manager_max_horizon": 5,
   "max_actions_per_period": 8,
   "lookahead_days": 3,
-  "backlog_cost": 3.0,
+  "backlog_cost": 1.5,
   "holding_cost": 0.5,
   "dense_production_reward": 20.0,
   "dense_setup_penalty": 0.0,

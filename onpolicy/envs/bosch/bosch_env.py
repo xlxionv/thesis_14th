@@ -623,36 +623,24 @@ class BoschEnv(object):
         num_days = 1 + lookahead
         
         # 1. Calculate Piecewise Targets (Per Product, Per Day)
-        # We split "Day 0" into "Backlog" (d=0) and "Today" (d=1) to prioritize backlog
-        num_days = 1 + 1 + lookahead # [Backlog, Today, Tomorrow, ...]
+        # We satisfy (Backlog + Today) first, then Future Demand, using Inventory + Current Queue
         daily_targets = np.zeros((self.num_products, num_days), dtype=np.float32)
         
         for p in range(self.num_products):
             supply = float(self.inventory[p] + self.queue[:, p].sum())
-            
-            # Sub-Day 0: Backlog
-            bl_demand = float(self.backlog[p])
-            if supply >= bl_demand:
-                supply -= bl_demand
+            # Day 0: Backlog + Current Period Demand
+            d0_demand = float(self.backlog[p] + self.demand[self.period_index, p])
+            if supply >= d0_demand:
+                supply -= d0_demand
                 daily_targets[p, 0] = 0
             else:
-                daily_targets[p, 0] = bl_demand - supply
-                supply = 0
-                
-            # Sub-Day 1: Today's Demand
-            today_demand = float(self.demand[self.period_index, p])
-            if supply >= today_demand:
-                supply -= today_demand
-                daily_targets[p, 1] = 0
-            else:
-                daily_targets[p, 1] = today_demand - supply
+                daily_targets[p, 0] = d0_demand - supply
                 supply = 0
             
-            # Days 2..num_days-1: Future demand
-            for d in range(2, num_days):
-                fut_idx = self.period_index + (d - 1)
-                if fut_idx < self.num_periods:
-                    fut_demand = float(self.demand[fut_idx, p])
+            # Days 1..lookahead: Future demand
+            for d in range(1, num_days):
+                if self.period_index + d < self.num_periods:
+                    fut_demand = float(self.demand[self.period_index + d, p])
                 else:
                     fut_demand = 0.0
                 
@@ -664,23 +652,18 @@ class BoschEnv(object):
                     supply = 0
 
         # 2. Expanded LP: Variables x[line, prod, day]
+        # total_vars = L * P * D
         L, P, D = self.num_lines, self.num_products, num_days
         num_vars = L * P * D
         
         # Objective: minimize (ProductionCost - Benefit[day]) * x
+        # Benefit[day] = BacklogCost - (day * HoldingCost)
         c = np.zeros(num_vars)
         for l in range(L):
             for p in range(P):
                 for d in range(D):
                     idx = (l * P * D) + (p * D) + d
-                    if d == 0:
-                        # Backlog is most urgent (+1.0 bonus)
-                        benefit = self.backlog_cost + 1.0
-                    else:
-                        # Pre-building (days_ahead = d - 1)
-                        days_ahead = d - 1
-                        benefit = self.backlog_cost - (days_ahead * self.holding_cost)
-                    
+                    benefit = self.backlog_cost - (d * self.holding_cost)
                     c[idx] = self.production_cost_matrix[l, p] - benefit
 
         A_ub = []
@@ -1267,15 +1250,15 @@ class BoschEnv(object):
             vec = np.zeros(self.obs_dim, dtype=np.float32)
             pos = 0
 
-            # Inventory (Log-scaled)
-            vec[pos : pos + self.num_products] = np.log1p(inv) / 10.0
+            # Inventory
+            vec[pos : pos + self.num_products] = inv
             pos += self.num_products
 
-            # Backlog (Log-scaled)
-            vec[pos : pos + self.num_products] = np.log1p(back) / 10.0
+            # Backlog
+            vec[pos : pos + self.num_products] = back
             pos += self.num_products
 
-            # Queue (manager: per-line queues flattened; machines: own line queue) (Log-scaled)
+            # Queue (manager: per-line queues flattened; machines: own line queue)
             if agent_id == 0:
                 queue_vec = self.queue.reshape(-1).astype(np.float32)
             else:
@@ -1285,7 +1268,7 @@ class BoschEnv(object):
                     start = line_idx * self.num_products
                     end = start + self.num_products
                     queue_vec[start:end] = self.queue[line_idx].astype(np.float32)
-            vec[pos : pos + queue_segment_len] = np.log1p(queue_vec) / 10.0
+            vec[pos : pos + queue_segment_len] = queue_vec
             pos += queue_segment_len
 
             # Coverage (manager only; machines get zeros)
@@ -1293,25 +1276,26 @@ class BoschEnv(object):
                 vec[pos : pos + self.num_products] = coverage
             pos += self.num_products
 
-            # Queue total per product (manager only; machines get zeros) (Log-scaled)
+            # Queue total per product (manager only; machines get zeros)
             if agent_id == 0:
-                vec[pos : pos + self.num_products] = np.log1p(queue_total) / 10.0
+                vec[pos : pos + self.num_products] = queue_total
             pos += self.num_products
 
-            # Shortfall per product (manager only; machines get zeros) (Log-scaled)
+            # Shortfall per product (manager only; machines get zeros)
             if agent_id == 0:
                 if demand_window.shape[0] > 0:
+                    # NEW FIX: Sum the demand over the entire lookahead window!
                     demand_next = np.sum(demand_window, axis=0) 
                 else:
                     demand_next = np.zeros(self.num_products, dtype=np.float32)
                 shortfall = demand_next + back - inv - queue_total
                 shortfall = np.maximum(shortfall, 0.0)
-                vec[pos : pos + self.num_products] = np.log1p(shortfall) / 10.0
+                vec[pos : pos + self.num_products] = shortfall.astype(np.float32)
             pos += self.num_products
 
-            # Demand window (Log-scaled)
+            # Demand window
             window_flat = demand_window.reshape(-1)
-            vec[pos : pos + window_flat.size] = np.log1p(window_flat) / 10.0
+            vec[pos : pos + window_flat.size] = window_flat
             pos += window_flat.size
 
             # Remaining periods
