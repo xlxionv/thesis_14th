@@ -446,7 +446,7 @@ def make_train_env(all_args):
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "BOSCH":
-                env = BoschEnv(all_args)
+                env = BoschEnv(all_args, rank=rank)
             else:
                 print("Can not support the " + all_args.env_name + " environment.")
                 raise NotImplementedError
@@ -467,7 +467,7 @@ def make_eval_env(all_args):
     def get_env_fn(rank):
         def init_env():
             if all_args.env_name == "BOSCH":
-                env = BoschEnv(all_args)
+                env = BoschEnv(all_args, rank=rank)
             else:
                 print("Can not support the " + all_args.env_name + " environment.")
                 raise NotImplementedError
@@ -521,6 +521,18 @@ def parse_args(args, parser):
         type=int,
         default=1,
         help="Print debug report every N periods.",
+    )
+    parser.add_argument(
+        "--debug_report_episode_interval",
+        type=int,
+        default=100,
+        help="Print detailed schedule every N episodes.",
+    )
+    parser.add_argument(
+        "--debug_report_file",
+        type=str,
+        default=None,
+        help="File to write detailed schedule analysis to.",
     )
 
     parser.add_argument("--holding_cost", type=float, default=1.0)
@@ -900,6 +912,9 @@ def main(args):
         run_dir = run_dir / curr_run
         if not run_dir.exists():
             os.makedirs(str(run_dir))
+
+    if all_args.debug_daily_report and all_args.debug_report_file is None:
+        all_args.debug_report_file = str(run_dir / "schedule_analysis.txt")
 
     snap_path = _snapshot_bosch_config(all_args.bosch_config, run_dir)
     if snap_path is not None:

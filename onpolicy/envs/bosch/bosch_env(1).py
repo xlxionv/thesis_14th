@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.optimize import linprog
 
 try:
     import gymnasium as gym
@@ -20,14 +19,8 @@ class BoschEnv(object):
         agents 1-6 : machine agents, one per line
     """
 
-    def __init__(self, args, rank=0):
+    def __init__(self, args):
         # Core configuration (with sensible defaults if attributes are missing)
-        self.rank = rank
-        self.episode_count = 0
-        self.debug_daily_report = getattr(args, "debug_daily_report", False)
-        self.debug_report_episode_interval = getattr(args, "debug_report_episode_interval", 1000)
-        self.debug_report_file = getattr(args, "debug_report_file", None)
-        
         self.num_lines = getattr(args, "num_lines", 6)
         self.num_products = getattr(args, "num_products", 3)
         # Number of decision periods (planning horizon)
@@ -355,9 +348,7 @@ class BoschEnv(object):
         if seed is not None:
             self.rng.seed(seed)
 
-    def reset(self, seed=None):
-        self.seed(seed)
-        self.episode_count += 1
+    def reset(self):
         self._reset_state()
         self._start_new_period()
         return self._build_observations()
@@ -472,6 +463,9 @@ class BoschEnv(object):
                 # Machine agents are inactive on manager micro-steps.
                 info["machine_active"] = 0.0 if is_manager_step else 1.0
             infos.append(info)
+
+        # Apply reward scaling (0.001) to keep gradients stable
+        rewards *= 0.001
 
         return obs, rewards, dones, infos
 
@@ -594,6 +588,12 @@ class BoschEnv(object):
         # Store for logging and reward sharing
         self.last_manager_masks = masks.copy()
 
+        # --- CORRECT FIX: Reset queue at period boundary ---
+        # Each period gets a fresh allocation. Unmet demand from the previous
+        # period is already captured in self.backlog. There is no info loss.
+        self.queue[:] = 0.0
+        # ---------------------------------------------------
+
         # Backward-compatible tracking
         self.last_manager_horizons = np.zeros(self.num_lines, dtype=np.float32)
         self.last_manager_products = np.full(self.num_lines, -1, dtype=np.int32)
@@ -609,142 +609,95 @@ class BoschEnv(object):
 
     def _heuristic_allocate(self, masks):
         """
-        Piecewise Cost-Optimal LP Allocator:
-        Assigns exact quantities to lines to minimize:
-        Sum(ProductionCost * qty) + Sum(HoldingCost * qty_prebuilt) - Sum(BacklogCost * qty_satisfying_backlog)
-        
-        Subject to:
-          - Machine capacity (including setup estimation)
-          - Daily demand targets (rolling lookahead)
-          - Manager masks and line eligibility
+        Given binary masks (L x P), fill queues using demand-proportional
+        allocation.
+
+        Two-stage logic:
+          - URGENCY (full lookahead window): determines which products to
+            prioritize and whether pre-building is warranted.
+          - QUANTITY (single-period cap): limits how much to actually queue
+            so we don't overshoot inventory.  The quantity target per product
+            is: today's demand + backlog - inventory - queue,
+            ensuring only ~1 day of production is queued at a time.
         """
-        from scipy.optimize import linprog
-        lookahead = min(self.num_periods - self.period_index, self.allocator_lookahead)
-        num_days = 1 + lookahead
-        
-        # 1. Calculate Piecewise Targets (Per Product, Per Day)
-        # We split "Day 0" into "Backlog" (d=0) and "Today" (d=1) to prioritize backlog
-        num_days = 1 + 1 + lookahead # [Backlog, Today, Tomorrow, ...]
-        daily_targets = np.zeros((self.num_products, num_days), dtype=np.float32)
-        
-        for p in range(self.num_products):
-            supply = float(self.inventory[p] + self.queue[:, p].sum())
-            
-            # Sub-Day 0: Backlog
-            bl_demand = float(self.backlog[p])
-            if supply >= bl_demand:
-                supply -= bl_demand
-                daily_targets[p, 0] = 0
-            else:
-                daily_targets[p, 0] = bl_demand - supply
-                supply = 0
-                
-            # Sub-Day 1: Today's Demand
-            today_demand = float(self.demand[self.period_index, p])
-            if supply >= today_demand:
-                supply -= today_demand
-                daily_targets[p, 1] = 0
-            else:
-                daily_targets[p, 1] = today_demand - supply
-                supply = 0
-            
-            # Days 2..num_days-1: Future demand
-            for d in range(2, num_days):
-                fut_idx = self.period_index + (d - 1)
-                if fut_idx < self.num_periods:
-                    fut_demand = float(self.demand[fut_idx, p])
+        L, P = self.num_lines, self.num_products
+        queue_add = np.zeros((L, P), dtype=np.float32)
+
+        t = self.period_index
+
+        # --- URGENCY & QUANTITY (Look across the full 5-day horizon) ---
+        lookahead_end = min(t + self.allocator_lookahead, self.num_periods)
+        if lookahead_end > t:
+            future_demand = np.sum(self.demand[t:lookahead_end], axis=0).astype(np.float32)
+        else:
+            future_demand = np.zeros(P, dtype=np.float32)
+
+        # Total amount needed in the next 5 days
+        total_qty_target = (
+            future_demand
+            + self.backlog
+            - self.inventory
+            - np.sum(self.queue, axis=0)
+        )
+        total_qty_target = np.maximum(total_qty_target, 0.0).copy()
+
+        # Urgency is used to sort which product gets priority on the machine
+        urgency = total_qty_target.copy()
+
+        # FIX: track the last allocated product per line within this allocation
+        # call so that setup time for the second+ product on a line correctly
+        # uses the previous allocated product (not the previous period's product).
+        last_allocated = self.line_setup.copy()  # start from previous period state
+
+        # For each line, allocate activated products
+        for l in range(L):
+            remaining_cap = float(self.capacity_per_line[l])
+
+            # Get activated products, sorted by URGENCY
+            active = []
+            for p in range(P):
+                if masks[l, p] > 0.5:
+                    active.append((p, float(urgency[p])))
+            active.sort(key=lambda x: -x[1])  # most urgent first
+
+            for p, _urg in active:
+                target = float(total_qty_target[p])
+                if target <= 0.0 or remaining_cap <= 0.0:
+                    continue
+
+                proc = float(self.processing_time_matrix[l, p])
+                if proc <= 0.0:
+                    continue
+
+                # FIX: estimate setup time using last_allocated[l], which is
+                # updated as products are scheduled on this line, so the second
+                # product's setup is from the first product → second, not from
+                # previous period → second.
+                last_p = int(last_allocated[l])
+                if last_p < 0:
+                    setup_time = float(self.first_setup_time[l])
+                elif last_p != p:
+                    setup_time = float(self.setup_time_matrix[l, last_p, p])
                 else:
-                    fut_demand = 0.0
-                
-                if supply >= fut_demand:
-                    supply -= fut_demand
-                    daily_targets[p, d] = 0
-                else:
-                    daily_targets[p, d] = fut_demand - supply
-                    supply = 0
+                    setup_time = 0.0
 
-        # 2. Expanded LP: Variables x[line, prod, day]
-        L, P, D = self.num_lines, self.num_products, num_days
-        num_vars = L * P * D
-        
-        # Objective: minimize (ProductionCost - Benefit[day]) * x
-        c = np.zeros(num_vars)
-        for l in range(L):
-            for p in range(P):
-                for d in range(D):
-                    idx = (l * P * D) + (p * D) + d
-                    if d == 0:
-                        # Backlog is most urgent (+1.0 bonus)
-                        benefit = self.backlog_cost + 1.0
-                    else:
-                        # Pre-building (days_ahead = d - 1)
-                        days_ahead = d - 1
-                        benefit = self.backlog_cost - (days_ahead * self.holding_cost)
-                    
-                    c[idx] = self.production_cost_matrix[l, p] - benefit
+                cap_after_setup = max(0.0, remaining_cap - setup_time)
 
-        A_ub = []
-        b_ub = []
+                # The machine can only process a maximum of 1 day's worth of capacity.
+                max_units_today = cap_after_setup / proc
 
-        # Constraint A: Machine Capacity sum_{p,d}(proc[l,p] * x[l,p,d]) <= Cap[l] - Setup[l]
-        for l in range(L):
-            row = np.zeros(num_vars)
-            setup_est = 0.0
-            # If current setup is not among active masks, we MUST switch.
-            active_prods = np.where(masks[l] > 0.5)[0]
-            curr_setup = int(self.line_setup[l])
-            
-            if len(active_prods) > 0:
-                if curr_setup < 0:
-                    setup_est = float(self.first_setup_time[l])
-                elif curr_setup not in active_prods:
-                    # Heuristic: cost of switching from current to the first active mask
-                    setup_est = float(self.setup_time_matrix[l, curr_setup, active_prods[0]])
-            
-            for p in range(P):
-                for d in range(D):
-                    idx = (l * P * D) + (p * D) + d
-                    row[idx] = self.processing_time_matrix[l, p]
-            A_ub.append(row)
-            b_ub.append(max(0.0, float(self.capacity_per_line[l] - setup_est)))
+                # We queue the smaller of: (What we need for 5 days) OR (What the machine can actually do today)
+                qty = min(target, max_units_today)
+                if qty <= 0.0:
+                    continue
 
-        # Constraint B: Daily Demand Targets sum_l(x[l,p,d]) <= DailyTarget[p,d]
-        for p in range(P):
-            for d in range(D):
-                row = np.zeros(num_vars)
-                for l in range(L):
-                    idx = (l * P * D) + (p * D) + d
-                    row[idx] = 1.0
-                A_ub.append(row)
-                b_ub.append(float(daily_targets[p, d]))
+                queue_add[l, p] = qty
+                remaining_cap -= qty * proc + setup_time
+                total_qty_target[p] -= qty   # reduce for other lines
+                urgency[p] -= qty            # keep urgency consistent
+                last_allocated[l] = p        # FIX: update for next product on same line
 
-        # Bounds: 0 <= x <= Target, and x=0 if not (mask & elig)
-        bounds = []
-        for l in range(L):
-            for p in range(P):
-                is_allowed = (masks[l, p] > 0.5) and (self.line_eligibility[l, p] > 0.5)
-                for d in range(D):
-                    if is_allowed:
-                        bounds.append((0, float(daily_targets[p, d])))
-                    else:
-                        bounds.append((0, 0))
-
-        # Solve LP
-        if len(A_ub) > 0:
-            res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-            if res.success:
-                x_opt = res.x.reshape((L, P, D))
-                queue_add = np.round(np.sum(x_opt, axis=2)).astype(np.float32)
-                # Safeguard: Rounding might slightly exceed capacity
-                for l in range(L):
-                    line_proc = np.sum(queue_add[l] * self.processing_time_matrix[l])
-                    cap_l = b_ub[l]
-                    if line_proc > cap_l and line_proc > 0:
-                        queue_add[l] = np.floor(queue_add[l] * (cap_l / line_proc))
-                return queue_add
-
-        return np.zeros((L, P), dtype=np.float32)
-
+        return queue_add
     def _estimate_setup_time(self, line_idx, product_idx):
         """Estimate setup time for switching to a product on a line."""
         last_prod = int(self.line_setup[line_idx])
@@ -946,8 +899,13 @@ class BoschEnv(object):
             mask[end_index] = 1.0
             return mask
 
-        # PM is always a valid control
-        mask[pm_index] = 1.0
+        # PM is a valid action only when there is enough remaining capacity
+        # to actually perform it. Masking it out when capacity < pm_time prevents
+        # machines from choosing PM as a no-op that burns an action slot without
+        # resetting age, which is especially harmful during early exploration.
+        pm_time_l = float(self.pm_time[line_idx]) if np.ndim(self.pm_time) > 0 else float(self.pm_time)
+        if self.remaining_capacity[line_idx] >= max(pm_time_l, 1e-6):
+            mask[pm_index] = 1.0
         
         # Check if there are any products we can actually process
         can_work = False
@@ -964,7 +922,12 @@ class BoschEnv(object):
 
     def _build_available_actions(self):
         # Agent 0 uses binary MultiDiscrete [0,1] per (line, product).
-        # Eligibility masking: [1,1] if eligible, [1,0] if not (force off).
+        # Eligibility masking only: [1,1] if eligible, [1,0] if not (force off).
+        # FIX: removed demand-based masking that forced products OFF when
+        # short-term inventory >= demand, which blocked pre-building and caused
+        # the manager to be unable to act on zero-demand periods that precede
+        # high-demand periods. The allocator already handles quantity correctly;
+        # the mask only needs to enforce hard eligibility constraints.
         if self.num_lines > 0 and self.num_products > 0:
             masks = []
             for line_idx in range(self.num_lines):
@@ -1085,6 +1048,7 @@ class BoschEnv(object):
         rewards[0, 0] = -float(manager_direct_costs) + self.alpha_cost_weight * (
             -float(worker_total_direct_costs)
         )
+
         # Activation penalty: discourage activating too many products
         if self.activation_penalty > 0.0:
             num_activated = float(np.sum(self.last_manager_masks))
@@ -1137,10 +1101,6 @@ class BoschEnv(object):
                             continue
                         rewards[1 + l, 0] -= beta * (w / d) * cost_p
 
-        # Optional: Detailed debug report
-        if self.debug_daily_report:
-            self._print_detailed_schedule()
-
         return rewards
 
     def _update_inventory_and_backlog(self, produced):
@@ -1166,10 +1126,11 @@ class BoschEnv(object):
             backlog_costs[p] = self.backlog_cost * self.backlog[p]
             if self.backlog[p] > 0:
                 backlog_costs[p] += self.per_product_backlog_penalty
-
+        
         self.last_product_service_costs = inv_costs + backlog_costs
         inv_cost = float(np.sum(inv_costs))
         backlog_cost = float(np.sum(backlog_costs))
+        
         return inv_cost, backlog_cost, inv_costs, backlog_costs
 
     def _decode_agent0_action(self, action_vec):
@@ -1207,12 +1168,12 @@ class BoschEnv(object):
         """
         remaining_periods = self.num_periods - self.period_index
 
-        # Shared pieces
-        inv = self.inventory.astype(np.float32)
-        back = self.backlog.astype(np.float32)
+        # Shared pieces - Apply log scaling to prevent saturation
+        inv = np.log1p(self.inventory.astype(np.float32))
+        back = np.log1p(self.backlog.astype(np.float32))
         queue_segment_len = self.num_lines * self.num_products
         coverage = (self.queue > 0).astype(np.float32).sum(axis=0)
-        queue_total = np.sum(self.queue, axis=0).astype(np.float32)
+        queue_total = np.log1p(np.sum(self.queue, axis=0).astype(np.float32))
         if self.num_lines > 0:
             coverage /= float(self.num_lines)
         demand_window = np.zeros(
@@ -1221,7 +1182,8 @@ class BoschEnv(object):
         for d in range(self.lookahead_days):
             target_idx = self.period_index + d
             if target_idx < self.num_periods:
-                demand_window[d] = self.demand[target_idx]
+                # Apply log scaling to demand
+                demand_window[d] = np.log1p(self.demand[target_idx])
 
         # Contention: for each line, how many eligible products have demand this period
         contention = np.zeros(self.num_lines, dtype=np.float32)
@@ -1267,25 +1229,27 @@ class BoschEnv(object):
             vec = np.zeros(self.obs_dim, dtype=np.float32)
             pos = 0
 
-            # Inventory (Log-scaled)
-            vec[pos : pos + self.num_products] = np.log1p(inv) / 10.0
+            # Inventory
+            vec[pos : pos + self.num_products] = inv
             pos += self.num_products
 
-            # Backlog (Log-scaled)
-            vec[pos : pos + self.num_products] = np.log1p(back) / 10.0
+            # Backlog
+            vec[pos : pos + self.num_products] = back
             pos += self.num_products
 
-            # Queue (manager: per-line queues flattened; machines: own line queue) (Log-scaled)
+            # Queue (manager: per-line queues flattened; machines: own line queue)
             if agent_id == 0:
-                queue_vec = self.queue.reshape(-1).astype(np.float32)
+                # Manager sees everything, log-scaled
+                queue_vec = np.log1p(self.queue.reshape(-1).astype(np.float32))
             else:
+                # Machine sees only their line
                 queue_vec = np.zeros(queue_segment_len, dtype=np.float32)
                 line_idx = agent_id - 1
                 if 0 <= line_idx < self.num_lines:
                     start = line_idx * self.num_products
                     end = start + self.num_products
-                    queue_vec[start:end] = self.queue[line_idx].astype(np.float32)
-            vec[pos : pos + queue_segment_len] = np.log1p(queue_vec) / 10.0
+                    queue_vec[start:end] = np.log1p(self.queue[line_idx].astype(np.float32))
+            vec[pos : pos + queue_segment_len] = queue_vec
             pos += queue_segment_len
 
             # Coverage (manager only; machines get zeros)
@@ -1293,25 +1257,26 @@ class BoschEnv(object):
                 vec[pos : pos + self.num_products] = coverage
             pos += self.num_products
 
-            # Queue total per product (manager only; machines get zeros) (Log-scaled)
+            # Queue total per product (manager only; machines get zeros)
+            # FIX: was declared in obs_dim formula but never written, causing
+            # all subsequent fields to be shifted 8 positions earlier than declared.
             if agent_id == 0:
-                vec[pos : pos + self.num_products] = np.log1p(queue_total) / 10.0
+                vec[pos : pos + self.num_products] = queue_total
             pos += self.num_products
 
-            # Shortfall per product (manager only; machines get zeros) (Log-scaled)
+            # Shortfall per product (manager only; machines get zeros)
+            # Calculated as log(1 + max(0, demand_next_5_days + backlog - inventory - queue))
             if agent_id == 0:
-                if demand_window.shape[0] > 0:
-                    demand_next = np.sum(demand_window, axis=0) 
-                else:
-                    demand_next = np.zeros(self.num_products, dtype=np.float32)
-                shortfall = demand_next + back - inv - queue_total
-                shortfall = np.maximum(shortfall, 0.0)
-                vec[pos : pos + self.num_products] = np.log1p(shortfall) / 10.0
+                raw_demand_next = np.sum(self.demand[self.period_index : self.period_index + self.lookahead_days], axis=0)
+                raw_shortfall = raw_demand_next + self.backlog - self.inventory - np.sum(self.queue, axis=0)
+                shortfall = np.log1p(np.maximum(raw_shortfall, 0.0))
+                vec[pos : pos + self.num_products] = shortfall.astype(np.float32)
             pos += self.num_products
 
-            # Demand window (Log-scaled)
+
+            # Demand window
             window_flat = demand_window.reshape(-1)
-            vec[pos : pos + window_flat.size] = np.log1p(window_flat) / 10.0
+            vec[pos : pos + window_flat.size] = window_flat
             pos += window_flat.size
 
             # Remaining periods
@@ -1361,71 +1326,6 @@ class BoschEnv(object):
         return np.asarray(obs_all, dtype=np.float32)
 
     # Optional compatibility with env_wrappers rendering
-    def _print_detailed_schedule(self):
-        """Prints or writes a human-readable summary of the period's production and status."""
-        # Only print for thread 0 and at the specified episode interval
-        if self.rank != 0 or (self.episode_count % self.debug_report_episode_interval != 0):
-            return
-
-        import io
-        buf = io.StringIO()
-
-        t = self.period_index
-        buf.write("\n" + "=" * 85 + "\n")
-        buf.write(f" 🏭 DETAILED SCHEDULE ANALYSIS (WHAT THE SOLVER DECIDED) - THREAD {self.rank}\n")
-        buf.write("=" * 85 + "\n")
-
-        demand_today = self.demand[t]
-        buf.write(f"\n[ PERIOD {t+1} ] - Demand for today: {demand_today.astype(int).tolist()}\n")
-        buf.write("-" * 50 + "\n")
-        
-        buf.write("MACHINE ACTIONS:\n")
-        for l in range(self.num_lines):
-            line_name = f"Line {l}"
-            if self.line_codes is not None and l < len(self.line_codes):
-                line_name = f"{self.line_codes[l]} (L{l})"
-            
-            produced_indices = np.where(self.period_produced_per_line[l] > 0)[0]
-            if len(produced_indices) == 0:
-                buf.write(f"  {line_name}: 💤 IDLE\n")
-            else:
-                actions = []
-                for p in produced_indices:
-                    p_name = f"Prod {p}"
-                    if self.product_codes is not None and p < len(self.product_codes):
-                        p_name = f"{self.product_codes[p]} (P{p})"
-                    qty = int(self.period_produced_per_line[l, p])
-                    actions.append(f"📦 {p_name} (Qty: {qty})")
-                buf.write(f"  {line_name}: {', '.join(actions)}\n")
-
-        buf.write("\nEND OF DAY STATUS:\n")
-        active_products = set(np.where(self.period_produced_per_product > 0)[0]) | \
-                          set(np.where(self.inventory > 0)[0]) | \
-                          set(np.where(self.backlog > 0)[0]) | \
-                          set(np.where(demand_today > 0)[0])
-        
-        for p in sorted(list(active_products)):
-            p_name = f"Prod {p}"
-            if self.product_codes is not None and p < len(self.product_codes):
-                p_name = f"{self.product_codes[p]} (P{p})"
-            
-            inv = int(self.inventory[p])
-            back = int(self.backlog[p])
-            dem = int(demand_today[p])
-            buf.write(f"  {p_name:15} | Demand: {dem:5} | Inventory: {inv:5} | Backlog: {back:5}\n")
-        
-        buf.write("=" * 85 + "\n\n")
-
-        report_str = buf.getvalue()
-        if self.debug_report_file:
-            try:
-                with open(self.debug_report_file, "a", encoding="utf-8") as f:
-                    f.write(report_str)
-            except Exception as e:
-                print(f"[BoschEnv] Failed to write to debug_report_file {self.debug_report_file}: {e}")
-        else:
-            print(report_str)
-
     def render(self, mode="human"):
         return None
 
