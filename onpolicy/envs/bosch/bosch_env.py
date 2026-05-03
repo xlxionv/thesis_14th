@@ -617,85 +617,93 @@ class BoschEnv(object):
     def _heuristic_allocate(self, masks):
         L, P = self.num_lines, self.num_products
         queue_add = np.zeros((L, P), dtype=np.float32)
-
         t = self.period_index
 
-        # --- QUANTITY (Look across a 2-day horizon) ---
-        lookahead_end = min(t + 2, self.num_periods)
-        if lookahead_end > t:
-            two_day_demand = np.sum(self.demand[t:lookahead_end], axis=0).astype(np.float32)
-        else:
-            two_day_demand = np.zeros(P, dtype=np.float32)
-
-        total_qty_target = (
-            two_day_demand
-            + self.backlog
-            - self.inventory
-            - np.sum(self.queue, axis=0)
+        # 1-day need signal
+        today_demand = self.demand[t].astype(np.float32)
+        raw_need = np.maximum(
+            today_demand + self.backlog - self.inventory - np.sum(self.queue, axis=0),
+            0.0
         )
-        total_qty_target = np.maximum(total_qty_target, 0.0).copy()
-        
+        total_qty_target = raw_need.copy()
+
+        # Pre-build override: if Manager activated a product but today's need = 0,
+        # and there is demand in the next 2 days, use that as the target.
+        # 2-day window keeps proportional splits accurate; per-iteration cap
+        # prevents over-allocation regardless.
+        prebuild_end = min(t + 2, self.num_periods)
+        if prebuild_end > t:
+            prebuild_demand = np.sum(
+                self.demand[t:prebuild_end], axis=0
+            ).astype(np.float32)
+        else:
+            prebuild_demand = np.zeros(P, dtype=np.float32)
+
+        for p in range(P):
+            if total_qty_target[p] <= 0.0 and prebuild_demand[p] > 0.0:
+                any_line_active = any(
+                    masks[l, p] > 0.5 and self.line_eligibility[l, p] > 0.5
+                    for l in range(L)
+                )
+                if any_line_active:
+                    total_qty_target[p] = prebuild_demand[p]
+
         last_allocated = self.line_setup.copy()
 
-        # For each line, allocate activated products
         for l in range(L):
             remaining_cap = float(self.capacity_per_line[l])
 
-            # Get activated products for this line
-            active = []
-            for p in range(P):
-                if masks[l, p] > 0.5 and total_qty_target[p] > 0:
-                    active.append(p)
-                    
-            # NO URGENCY SORT! We leave them in default order. 
-            # The Machine Agent will use its micro-steps to decide the actual sequence!
+            # No sort — order irrelevant under proportional split
+            active = [
+                p for p in range(P)
+                if masks[l, p] > 0.5
+                and self.line_eligibility[l, p] > 0.5
+                and total_qty_target[p] > 0.0
+            ]
 
-            for i, p in enumerate(active):
+            if not active:
+                continue
+
+            # --- NEW: FAIR SETUP ESTIMATION ---
+            # Estimate the total setup time for the day assuming a "naive" average route.
+            # 1. Initial setup for the first product
+            last_p = int(last_allocated[l])
+            if last_p < 0:
+                est_total_setup = float(self.first_setup_time[l])
+            else:
+                # We don't know the sequence, so we just average the setup from last_p to all active products
+                est_total_setup = sum(float(self.setup_time_matrix[l, last_p, p]) for p in active) / len(active)
+                
+            # 2. Add the average intra-period setup times between all active products
+            if len(active) > 1:
+                # Average setup time between any two products on this line
+                avg_intra_setup = np.mean(self.setup_time_matrix[l]) 
+                # Multiply by the number of switches (len(active) - 1)
+                est_total_setup += avg_intra_setup * (len(active) - 1)
+
+            # Calculate the "Pure Production Time" available today
+            pure_production_cap = max(0.0, remaining_cap - est_total_setup)
+            # ----------------------------------
+
+            # --- FAIR PROPORTIONAL SPLIT ---
+            total_active_target = sum(float(total_qty_target[p]) for p in active)
+
+            for p in active:
                 target = float(total_qty_target[p])
-                if target <= 0.0 or remaining_cap <= 0.0:
-                    continue
-
                 proc = float(self.processing_time_matrix[l, p])
-                if proc <= 0.0:
-                    continue
-                    
-                # --- PROPORTIONAL CAPACITY SPLIT ---
-                # Calculate the total need of ALL remaining active products for this line
-                remaining_target_sum = sum(
-                    float(total_qty_target[act_p]) for act_p in active[i:] 
-                    if total_qty_target[act_p] > 0
-                )
                 
-                # Give this product its "Fair Share" of the remaining hours
-                if remaining_target_sum > 0:
-                    proportion = target / remaining_target_sum
-                else:
-                    proportion = 1.0
-                    
-                allocated_cap = remaining_cap * proportion
-                # -----------------------------------
-
-                last_p = int(last_allocated[l])
-                if last_p < 0:
-                    setup_time = float(self.first_setup_time[l])
-                elif last_p != p:
-                    setup_time = float(self.setup_time_matrix[l, last_p, p])
-                else:
-                    setup_time = 0.0
-
-                cap_after_setup = max(0.0, allocated_cap - setup_time)
-                max_units_today = cap_after_setup / proc
-
+                # Give the product its exact fair share of the PURE production capacity
+                allocated_time = pure_production_cap * (target / total_active_target)
+                
+                max_units_today = allocated_time / proc
                 qty = min(target, max_units_today)
-                if qty <= 0.0:
-                    continue
 
-                queue_add[l, p] = qty
-                
-                # Subtract what it actually used from the REAL total capacity
-                remaining_cap -= (qty * proc + setup_time)
-                total_qty_target[p] -= qty   
-                last_allocated[l] = p        
+                if qty > 0.0:
+                    queue_add[l, p] = qty
+                    total_qty_target[p] -= qty
+                    
+            # Update last_allocated to the last product in the array for tomorrow's reference
+            last_allocated[l] = active[-1]
 
         return queue_add
     def _estimate_setup_time(self, line_idx, product_idx):

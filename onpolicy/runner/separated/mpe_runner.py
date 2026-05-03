@@ -581,6 +581,9 @@ class MPERunner(Runner):
         eval_rnn_states = np.zeros((self.n_eval_rollout_threads, self.num_agents, self.recurrent_N, self.hidden_size), dtype=np.float32)
         eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
 
+        # --- Track Solving Time ---
+        eval_start_time = time.time()
+
         for eval_step in range(self.episode_length):
             eval_temp_actions_env = []
             for agent_id in range(self.num_agents):
@@ -632,6 +635,13 @@ class MPERunner(Runner):
             eval_rnn_states[eval_dones == True] = np.zeros(((eval_dones == True).sum(), self.recurrent_N, self.hidden_size), dtype=np.float32)
             eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
             eval_masks[eval_dones == True] = np.zeros(((eval_dones == True).sum(), 1), dtype=np.float32)
+
+        eval_duration = time.time() - eval_start_time
+        print(f"\n[EVAL] BOSCH MARL Inference Solving Time for {self.episode_length} periods: {eval_duration:.4f} seconds")
+        if self.use_wandb:
+            wandb.log({"eval_inference_seconds": eval_duration}, step=total_num_steps)
+        else:
+            self.writter.add_scalars("eval_inference_seconds", {"eval_inference_seconds": eval_duration}, total_num_steps)
 
         eval_episode_rewards = np.array(eval_episode_rewards)
         

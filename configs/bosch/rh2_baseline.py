@@ -42,7 +42,8 @@ def compute_period_cost(
         inv_cost += h_cost * new_inventory[p]
         backlog_cost += b_cost * new_backlog[p]
         if new_backlog[p] > 0.0:
-            if new_backlog[p] > 0.001: backlog_cost += backlog_penalty
+            pen = backlog_penalty[p] if isinstance(backlog_penalty, list) else backlog_penalty
+            if new_backlog[p] > 0.001: backlog_cost += pen
 
     prod_cost = np.sum(produced * prod_cost_mat)
     setup_cost = np.sum(setup_costs)
@@ -140,7 +141,8 @@ def solve_lookahead_window(start_t, window, data, state, time_limit=60):
     for t in range(window):
         for p in range(P):
             obj.append(data["holding_cost"] * inv[t][p])
-            obj.append(data["backlog_cost"] * back[t][p] + data["per_product_backlog_penalty"] * is_backlog[t][p])
+            pen = data["per_product_backlog_penalty"][p] if isinstance(data["per_product_backlog_penalty"], list) else data["per_product_backlog_penalty"]
+            obj.append(data["backlog_cost"] * back[t][p] + pen * is_backlog[t][p])
             for l in range(L):
                 if elig[l][p] > 0.5:
                     obj.append(data["production_cost_matrix"][l][p] * x[t][l][p])
