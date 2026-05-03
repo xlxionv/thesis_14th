@@ -102,6 +102,7 @@ PyOpenGL==3.1.5
 PyOpenGL-accelerate==3.1.5
 pyparsing==2.2.2
 pyrsistent==0.16.0
+PuLP==2.8.0
 PySC2==3.0.0
 pytest==3.8.2
 python-dateutil==2.7.3

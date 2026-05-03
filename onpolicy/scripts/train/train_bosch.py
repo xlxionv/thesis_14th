@@ -685,6 +685,57 @@ def parse_args(args, parser):
         help="Per-activated-slot penalty for manager reward.",
     )
     parser.add_argument(
+        "--allocator_mode",
+        type=str,
+        default="heuristic",
+        choices=["heuristic", "relaxed_milp", "milp", "relaxed", "relaxed_lp"],
+        help="Queue allocator used after the manager step.",
+    )
+    parser.add_argument(
+        "--relaxed_milp_lookahead",
+        type=int,
+        default=2,
+        help="Rolling-horizon window for allocator_mode=relaxed_milp.",
+    )
+    parser.add_argument(
+        "--relaxed_milp_time_limit",
+        type=float,
+        default=1.0,
+        help="CBC time limit per relaxed MILP allocator solve in seconds.",
+    )
+    parser.add_argument(
+        "--relaxed_milp_use_manager_mask",
+        action="store_true",
+        default=False,
+        help="Constrain relaxed MILP line-product choices by manager action.",
+    )
+    parser.add_argument(
+        "--no_relaxed_milp_fallback",
+        dest="relaxed_milp_fallback_to_heuristic",
+        action="store_false",
+        default=True,
+        help="Disable fallback to heuristic allocator if relaxed MILP fails.",
+    )
+    parser.add_argument(
+        "--relaxed_milp_setup_time_mode",
+        type=str,
+        default="average",
+        choices=["average", "mean", "mean_std", "p75", "p90", "worst"],
+        help="Robust setup-time estimate used in relaxed MILP capacity.",
+    )
+    parser.add_argument(
+        "--relaxed_milp_setup_time_std_mult",
+        type=float,
+        default=1.0,
+        help="Std multiplier when relaxed_milp_setup_time_mode=mean_std.",
+    )
+    parser.add_argument(
+        "--relaxed_milp_capacity_safety",
+        type=float,
+        default=1.0,
+        help="Capacity multiplier in relaxed MILP; use 0.90-0.95 for buffer.",
+    )
+    parser.add_argument(
         "--debug_actions",
         action="store_true",
         default=False,
@@ -739,6 +790,14 @@ def parse_args(args, parser):
         "cm_time",
         "eligibility_matrix",
         "demand_profile",
+        "allocator_mode",
+        "relaxed_milp_lookahead",
+        "relaxed_milp_time_limit",
+        "relaxed_milp_use_manager_mask",
+        "relaxed_milp_fallback_to_heuristic",
+        "relaxed_milp_setup_time_mode",
+        "relaxed_milp_setup_time_std_mult",
+        "relaxed_milp_capacity_safety",
     }
     if cfg:
         missing = sorted([k for k in scenario_keys if k not in cfg])

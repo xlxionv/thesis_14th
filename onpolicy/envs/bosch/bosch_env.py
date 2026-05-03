@@ -7,6 +7,11 @@ except ImportError:
     import gym
     from gym import spaces
 
+try:
+    import pulp
+except ImportError:
+    pulp = None
+
 from onpolicy.utils.multi_discrete import MultiDiscrete
 
 
@@ -110,6 +115,48 @@ class BoschEnv(object):
         self.activation_penalty = float(
             getattr(args, "activation_penalty", 0.0)
         )
+        self.allocator_mode = str(
+            getattr(args, "allocator_mode", "heuristic")
+        ).strip().lower()
+        if self.allocator_mode in ("milp", "relaxed", "relaxed_lp"):
+            self.allocator_mode = "relaxed_milp"
+        if self.allocator_mode not in ("heuristic", "relaxed_milp"):
+            raise ValueError(
+                "allocator_mode must be 'heuristic' or 'relaxed_milp', "
+                f"got {self.allocator_mode!r}."
+            )
+        self.relaxed_milp_lookahead = int(
+            getattr(args, "relaxed_milp_lookahead", 2)
+        )
+        self.relaxed_milp_time_limit = float(
+            getattr(args, "relaxed_milp_time_limit", 1.0)
+        )
+        self.relaxed_milp_use_manager_mask = bool(
+            getattr(args, "relaxed_milp_use_manager_mask", False)
+        )
+        self.relaxed_milp_fallback_to_heuristic = bool(
+            getattr(args, "relaxed_milp_fallback_to_heuristic", True)
+        )
+        self.relaxed_milp_setup_time_mode = str(
+            getattr(args, "relaxed_milp_setup_time_mode", "average")
+        ).strip().lower()
+        if self.relaxed_milp_setup_time_mode == "mean":
+            self.relaxed_milp_setup_time_mode = "average"
+        valid_setup_modes = {"average", "mean_std", "p75", "p90", "worst"}
+        if self.relaxed_milp_setup_time_mode not in valid_setup_modes:
+            raise ValueError(
+                "relaxed_milp_setup_time_mode must be one of "
+                f"{sorted(valid_setup_modes)}, got "
+                f"{self.relaxed_milp_setup_time_mode!r}."
+            )
+        self.relaxed_milp_setup_time_std_mult = float(
+            getattr(args, "relaxed_milp_setup_time_std_mult", 1.0)
+        )
+        self.relaxed_milp_capacity_safety = float(
+            getattr(args, "relaxed_milp_capacity_safety", 1.0)
+        )
+        if self.relaxed_milp_capacity_safety <= 0.0:
+            raise ValueError("relaxed_milp_capacity_safety must be > 0.")
 
         # Per-product processing times and mean demand (kept for compatibility)
         self.processing_time = self._get_array_arg(
@@ -406,6 +453,7 @@ class BoschEnv(object):
                 done = True
 
         obs = self._build_observations()
+        next_is_manager_step = self.step_in_period == 0
         dones = [done for _ in range(self.num_agents)]
         next_available_actions = self._build_available_actions()
         infos = []
@@ -413,7 +461,7 @@ class BoschEnv(object):
             info = {"available_actions": next_available_actions[agent_id].copy()}
             if agent_id == 0:
                 # This flag is for next-step policy loss masking in the runner.
-                info["manager_active"] = 1.0 if is_manager_step else 0.0
+                info["manager_active"] = 1.0 if next_is_manager_step else 0.0
                 if end_of_period:
                     info["period_inv_cost"] = float(self.last_inv_cost)
                     info["period_backlog_cost"] = float(self.last_backlog_cost)
@@ -454,6 +502,13 @@ class BoschEnv(object):
                     info["period_cm_cost"] = float(self.last_cm_cost)
                     info["period_utilization"] = float(self.last_utilization_total)
                     info["period_utilization_per_line"] = self.last_utilization_per_line.copy()
+                    info["period_allocator_status"] = self.last_allocator_status
+                    info["period_allocator_objective"] = float(
+                        self.last_allocator_objective
+                    )
+                    info["period_allocator_capacity_safety"] = float(
+                        self.relaxed_milp_capacity_safety
+                    )
                     # RH2-compatible total cost = inv + backlog + prod + setup + pm + cm
                     period_total = (
                         float(self.last_inv_cost)
@@ -467,8 +522,8 @@ class BoschEnv(object):
                     self.episode_total_cost += period_total
                     info["episode_total_cost"] = float(self.episode_total_cost)
             else:
-                # Machine agents are inactive on manager micro-steps.
-                info["machine_active"] = 0.0 if is_manager_step else 1.0
+                # Machine agents are inactive on manager decision steps.
+                info["machine_active"] = 0.0 if next_is_manager_step else 1.0
             infos.append(info)
 
         # Apply reward scaling (0.001) to keep gradients stable
@@ -567,6 +622,8 @@ class BoschEnv(object):
         )
         self.last_utilization_total = 0.0
         self.last_utilization_per_line = np.zeros(self.num_lines, dtype=np.float32)
+        self.last_allocator_status = ""
+        self.last_allocator_objective = 0.0
 
     def _start_new_period(self):
         # Reset per-period capacity, flags, and aggregates, but keep
@@ -592,27 +649,38 @@ class BoschEnv(object):
         # Apply eligibility filter
         masks = masks * self.line_eligibility
 
-        # Store for logging and reward sharing
-        self.last_manager_masks = masks.copy()
-
-        # --- CORRECT FIX: Reset queue at period boundary ---
         # Each period gets a fresh allocation. Unmet demand from the previous
         # period is already captured in self.backlog. There is no info loss.
         self.queue[:] = 0.0
-        # ---------------------------------------------------
+
+        if self.allocator_mode == "relaxed_milp":
+            allowed_masks = (
+                masks.copy()
+                if self.relaxed_milp_use_manager_mask
+                else self.line_eligibility.copy()
+            )
+            queue_additions = self._relaxed_milp_allocate(allowed_masks)
+            if (
+                queue_additions is None
+                and self.relaxed_milp_fallback_to_heuristic
+            ):
+                queue_additions = self._heuristic_allocate(allowed_masks)
+            elif queue_additions is None:
+                queue_additions = np.zeros_like(self.queue)
+        else:
+            queue_additions = self._heuristic_allocate(masks)
+
+        self.queue += queue_additions
+        self.last_manager_masks = (queue_additions > 1e-6).astype(np.float32)
 
         # Backward-compatible tracking
         self.last_manager_horizons = np.zeros(self.num_lines, dtype=np.float32)
         self.last_manager_products = np.full(self.num_lines, -1, dtype=np.int32)
         for l in range(self.num_lines):
-            active_prods = np.where(masks[l] > 0.5)[0]
+            active_prods = np.where(self.last_manager_masks[l] > 0.5)[0]
             if len(active_prods) > 0:
                 self.last_manager_products[l] = int(active_prods[0])
                 self.last_manager_horizons[l] = float(self.allocator_lookahead)
-
-        # Run heuristic allocator to fill queues
-        queue_additions = self._heuristic_allocate(masks)
-        self.queue += queue_additions
 
     def _heuristic_allocate(self, masks):
         L, P = self.num_lines, self.num_products
@@ -706,6 +774,249 @@ class BoschEnv(object):
             last_allocated[l] = active[-1]
 
         return queue_add
+
+    def _relaxed_setup_time_candidates(self, line_idx, product_idx, offset):
+        candidates = []
+        if offset == 0:
+            candidates.append(self._estimate_setup_time(line_idx, product_idx))
+        else:
+            candidates.append(float(self.first_setup_time[line_idx]))
+
+        for prev in range(self.num_products):
+            if prev == product_idx:
+                continue
+            if self.line_eligibility[line_idx, prev] > 0.5:
+                candidates.append(
+                    float(self.setup_time_matrix[line_idx, prev, product_idx])
+                )
+
+        return candidates
+
+    def _relaxed_setup_time(self, line_idx, product_idx, offset):
+        candidates = np.asarray(
+            self._relaxed_setup_time_candidates(line_idx, product_idx, offset),
+            dtype=np.float32,
+        )
+        if candidates.size == 0:
+            return 0.0
+
+        mode = self.relaxed_milp_setup_time_mode
+        if mode == "worst":
+            return float(np.max(candidates))
+        if mode == "p90":
+            return float(np.percentile(candidates, 90))
+        if mode == "p75":
+            return float(np.percentile(candidates, 75))
+        if mode == "mean_std":
+            return float(
+                np.mean(candidates)
+                + self.relaxed_milp_setup_time_std_mult * np.std(candidates)
+            )
+        return float(np.mean(candidates))
+
+    def _relaxed_setup_cost(self, line_idx, product_idx, offset):
+        if offset == 0:
+            last_prod = int(self.line_setup[line_idx])
+            if last_prod < 0:
+                return float(self.first_setup_cost[line_idx])
+            if last_prod != product_idx:
+                return float(
+                    self.setup_cost_matrix[line_idx, last_prod, product_idx]
+                )
+            return 0.0
+
+        candidates = []
+        for prev in range(self.num_products):
+            if prev == product_idx:
+                continue
+            if self.line_eligibility[line_idx, prev] > 0.5:
+                candidates.append(
+                    float(self.setup_cost_matrix[line_idx, prev, product_idx])
+                )
+        if candidates:
+            return float(np.mean(candidates))
+        return float(self.first_setup_cost[line_idx])
+
+    def _relaxed_milp_allocate(self, allowed_masks):
+        """
+        Rolling-horizon lot-sizing allocator without sequence routing.
+        It chooses line-product quantities; machine agents still choose the
+        actual product order from each line's unsorted queue.
+        """
+        if pulp is None:
+            self.last_allocator_status = "pulp_missing"
+            if self.relaxed_milp_fallback_to_heuristic:
+                return None
+            raise ImportError(
+                "PuLP is required for allocator_mode='relaxed_milp'. "
+                "Install it with `pip install PuLP`."
+            )
+
+        L, P = self.num_lines, self.num_products
+        start_t = self.period_index
+        window = max(
+            1,
+            min(
+                int(self.relaxed_milp_lookahead),
+                self.num_periods - start_t,
+            ),
+        )
+        allowed = (np.asarray(allowed_masks, dtype=np.float32) > 0.5) & (
+            self.line_eligibility > 0.5
+        )
+
+        prob = pulp.LpProblem(
+            f"RelaxedAllocator_{start_t}", pulp.LpMinimize
+        )
+
+        x = [
+            [
+                [
+                    pulp.LpVariable(f"x_{k}_{l}_{p}", lowBound=0.0)
+                    for p in range(P)
+                ]
+                for l in range(L)
+            ]
+            for k in range(window)
+        ]
+        y = [
+            [
+                [
+                    pulp.LpVariable(f"y_{k}_{l}_{p}", cat="Binary")
+                    for p in range(P)
+                ]
+                for l in range(L)
+            ]
+            for k in range(window)
+        ]
+        inv = [
+            [
+                pulp.LpVariable(f"inv_{k}_{p}", lowBound=0.0)
+                for p in range(P)
+            ]
+            for k in range(window)
+        ]
+        back = [
+            [
+                pulp.LpVariable(f"back_{k}_{p}", lowBound=0.0)
+                for p in range(P)
+            ]
+            for k in range(window)
+        ]
+        has_backlog = [
+            [
+                pulp.LpVariable(f"has_backlog_{k}_{p}", cat="Binary")
+                for p in range(P)
+            ]
+            for k in range(window)
+        ]
+
+        demand_window = self.demand[start_t : start_t + window].astype(np.float32)
+        cap_units = np.zeros((L, P), dtype=np.float32)
+        for l in range(L):
+            for p in range(P):
+                proc = float(self.processing_time_matrix[l, p])
+                if proc > 0.0 and self.line_eligibility[l, p] > 0.5:
+                    cap_units[l, p] = float(self.capacity_per_line[l]) / proc
+
+        product_cap = np.sum(cap_units, axis=0)
+        backlog_big_m = (
+            np.sum(demand_window, axis=0)
+            + self.backlog
+            + product_cap * float(window)
+            + self.inventory
+            + 1.0
+        )
+
+        objective = []
+        for k in range(window):
+            global_t = start_t + k
+            for p in range(P):
+                prev_inv = self.inventory[p] if k == 0 else inv[k - 1][p]
+                prev_back = self.backlog[p] if k == 0 else back[k - 1][p]
+                produced = pulp.lpSum(x[k][l][p] for l in range(L))
+                prob += (
+                    prev_inv
+                    + produced
+                    - inv[k][p]
+                    + back[k][p]
+                    == float(self.demand[global_t, p]) + prev_back
+                )
+                prob += (
+                    back[k][p]
+                    <= float(backlog_big_m[p]) * has_backlog[k][p]
+                )
+
+                objective.append(float(self.holding_cost) * inv[k][p])
+                objective.append(float(self.backlog_cost) * back[k][p])
+                objective.append(
+                    float(self.per_product_backlog_penalty[p])
+                    * has_backlog[k][p]
+                )
+
+            for l in range(L):
+                capacity_terms = []
+                for p in range(P):
+                    proc = float(self.processing_time_matrix[l, p])
+                    if proc <= 0.0 or not bool(allowed[l, p]):
+                        prob += x[k][l][p] == 0.0
+                        prob += y[k][l][p] == 0.0
+                        continue
+
+                    prob += x[k][l][p] <= float(cap_units[l, p]) * y[k][l][p]
+
+                    setup_time = self._relaxed_setup_time(l, p, k)
+                    setup_cost = self._relaxed_setup_cost(l, p, k)
+                    capacity_terms.append(proc * x[k][l][p])
+                    capacity_terms.append(setup_time * y[k][l][p])
+
+                    objective.append(
+                        float(self.production_cost_matrix[l, p]) * x[k][l][p]
+                    )
+                    objective.append(
+                        float(self.hazard_rate[l])
+                        * float(self.cm_cost[l])
+                        * proc
+                        * x[k][l][p]
+                    )
+                    objective.append(setup_cost * y[k][l][p])
+
+                prob += (
+                    pulp.lpSum(capacity_terms)
+                    <= float(self.capacity_per_line[l])
+                    * self.relaxed_milp_capacity_safety
+                )
+
+        prob += pulp.lpSum(objective)
+
+        solver = pulp.PULP_CBC_CMD(
+            msg=False,
+            timeLimit=(
+                self.relaxed_milp_time_limit
+                if self.relaxed_milp_time_limit > 0.0
+                else None
+            ),
+        )
+        prob.solve(solver)
+
+        status = pulp.LpStatus.get(prob.status, str(prob.status))
+        self.last_allocator_status = status
+        objective_value = pulp.value(prob.objective)
+        self.last_allocator_objective = (
+            float(objective_value) if objective_value is not None else 0.0
+        )
+        if status != "Optimal":
+            return None
+
+        queue_add = np.zeros((L, P), dtype=np.float32)
+        for l in range(L):
+            for p in range(P):
+                val = pulp.value(x[0][l][p])
+                if val is not None and val > 1e-6:
+                    queue_add[l, p] = float(val)
+
+        return queue_add
+
     def _estimate_setup_time(self, line_idx, product_idx):
         """Estimate setup time for switching to a product on a line."""
         last_prod = int(self.line_setup[line_idx])
@@ -940,7 +1251,12 @@ class BoschEnv(object):
             masks = []
             for line_idx in range(self.num_lines):
                 for prod_idx in range(self.num_products):
-                    if self.line_eligibility[line_idx, prod_idx] > 0.5:
+                    if (
+                        self.allocator_mode == "relaxed_milp"
+                        and not self.relaxed_milp_use_manager_mask
+                    ):
+                        masks.append(np.array([1.0, 0.0], dtype=np.float32))
+                    elif self.line_eligibility[line_idx, prod_idx] > 0.5:
                         masks.append(np.array([1.0, 1.0], dtype=np.float32))
                     else:
                         masks.append(np.array([1.0, 0.0], dtype=np.float32))

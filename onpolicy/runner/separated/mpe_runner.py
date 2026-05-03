@@ -23,6 +23,84 @@ class MPERunner(Runner):
     def __init__(self, config):
         super(MPERunner, self).__init__(config)
 
+    def _is_bosch_env(self):
+        return getattr(self.all_args, "env_name", self.env_name) == "BOSCH"
+
+    def _bosch_line_eligibility_offset(self):
+        num_lines = int(getattr(self.all_args, "num_lines", self.num_agents - 1))
+        num_products = int(getattr(self.all_args, "num_products", 0))
+        lookahead_days = int(getattr(self.all_args, "lookahead_days", 5))
+
+        return (
+            2 * num_products
+            + num_lines * num_products
+            + num_products
+            + num_products
+            + num_products
+            + lookahead_days * num_products
+            + 1
+            + num_lines
+            + num_lines * num_products
+            + num_lines
+            + num_lines
+            + num_lines
+            + num_products
+        )
+
+    def _reset_active_masks(self, n_threads):
+        active_masks = np.ones((n_threads, self.num_agents, 1), dtype=np.float32)
+        if self._is_bosch_env() and self.num_agents > 1:
+            active_masks[:, 0, 0] = 1.0
+            active_masks[:, 1:, 0] = 0.0
+        return active_masks
+
+    def _reset_available_actions_from_obs(self, obs):
+        n_threads = obs.shape[0]
+        available_actions = self._default_available_actions(n_threads)
+        if not self._is_bosch_env():
+            return available_actions
+
+        num_lines = int(getattr(self.all_args, "num_lines", self.num_agents - 1))
+        num_products = int(getattr(self.all_args, "num_products", 0))
+        manager_dim = num_lines * num_products
+
+        if (
+            manager_dim > 0
+            and available_actions[0] is not None
+            and available_actions[0].shape[-1] == manager_dim * 2
+        ):
+            manager_mask = np.zeros(
+                (n_threads, manager_dim * 2), dtype=np.float32
+            )
+            manager_mask[:, 0::2] = 1.0
+            allocator_mode = str(
+                getattr(self.all_args, "allocator_mode", "heuristic")
+            ).lower()
+            if (
+                allocator_mode in ("relaxed_milp", "milp", "relaxed", "relaxed_lp")
+                and not bool(
+                    getattr(self.all_args, "relaxed_milp_use_manager_mask", False)
+                )
+            ):
+                available_actions[0] = manager_mask
+            else:
+                offset = self._bosch_line_eligibility_offset()
+                manager_obs = np.asarray(obs[:, 0], dtype=np.float32)
+                elig = manager_obs[:, offset : offset + manager_dim]
+                if elig.shape[-1] == manager_dim:
+                    manager_mask[:, 1::2] = (elig > 0.5).astype(np.float32)
+                    available_actions[0] = manager_mask
+
+        end_index = num_products + 1
+        for agent_id in range(1, self.num_agents):
+            if available_actions[agent_id] is None:
+                continue
+            available_actions[agent_id].fill(0.0)
+            if end_index < available_actions[agent_id].shape[-1]:
+                available_actions[agent_id][:, end_index] = 1.0
+
+        return available_actions
+
     def _default_available_actions(self, n_threads):
         available_actions = []
         for agent_id in range(self.num_agents):
@@ -111,6 +189,8 @@ class MPERunner(Runner):
                 "period_pm_cost": [],
                 "period_cm_cost": [],
                 "period_utilization": [],
+                "period_allocator_objective": [],
+                "period_allocator_capacity_safety": [],
                 "period_total_cost": [],
                 "episode_total_cost": [],
                 "period_backlog_per_product": [],
@@ -142,11 +222,25 @@ class MPERunner(Runner):
                     infos, self.n_rollout_threads
                 )
                 dones_env = np.all(dones, axis=1)
+                reset_available_actions = (
+                    self._reset_available_actions_from_obs(obs)
+                    if np.any(dones_env)
+                    else None
+                )
                 for agent_id in range(self.num_agents):
                     if available_actions[agent_id] is None:
                         continue
-                    available_actions[agent_id][dones_env == True] = 1.0
-                active_masks[dones_env == True] = 1.0
+                    if reset_available_actions is not None:
+                        available_actions[agent_id][
+                            dones_env == True
+                        ] = reset_available_actions[agent_id][dones_env == True]
+                if reset_available_actions is not None:
+                    reset_active_masks = self._reset_active_masks(
+                        self.n_rollout_threads
+                    )
+                    active_masks[dones_env == True] = reset_active_masks[
+                        dones_env == True
+                    ]
 
                 for env_idx in range(min(len(infos), self.n_rollout_threads)):
                     env_info = infos[env_idx]
@@ -243,6 +337,14 @@ class MPERunner(Runner):
                     if "period_utilization" in agent0_info:
                         env_infos["period_utilization"].append(
                             float(agent0_info["period_utilization"])
+                        )
+                    if "period_allocator_objective" in agent0_info:
+                        env_infos["period_allocator_objective"].append(
+                            float(agent0_info["period_allocator_objective"])
+                        )
+                    if "period_allocator_capacity_safety" in agent0_info:
+                        env_infos["period_allocator_capacity_safety"].append(
+                            float(agent0_info["period_allocator_capacity_safety"])
                         )
                     if "period_total_cost" in agent0_info:
                         env_infos["period_total_cost"].append(
@@ -460,7 +562,8 @@ class MPERunner(Runner):
     def warmup(self):
         # reset env
         obs = self.envs.reset()
-        available_actions = self._default_available_actions(self.n_rollout_threads)
+        available_actions = self._reset_available_actions_from_obs(obs)
+        active_masks = self._reset_active_masks(self.n_rollout_threads)
 
         share_obs = []
         for o in obs:
@@ -472,6 +575,7 @@ class MPERunner(Runner):
                 share_obs = np.array(list(obs[:, agent_id]))
             self.buffer[agent_id].share_obs[0] = share_obs.copy()
             self.buffer[agent_id].obs[0] = np.array(list(obs[:, agent_id])).copy()
+            self.buffer[agent_id].active_masks[0] = active_masks[:, agent_id].copy()
             if available_actions[agent_id] is not None:
                 self.buffer[agent_id].available_actions[0] = available_actions[
                     agent_id
@@ -574,9 +678,7 @@ class MPERunner(Runner):
     def eval(self, total_num_steps):
         eval_episode_rewards = []
         eval_obs = self.eval_envs.reset()
-        eval_available_actions = self._default_available_actions(
-            self.n_eval_rollout_threads
-        )
+        eval_available_actions = self._reset_available_actions_from_obs(eval_obs)
 
         eval_rnn_states = np.zeros((self.n_eval_rollout_threads, self.num_agents, self.recurrent_N, self.hidden_size), dtype=np.float32)
         eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
@@ -626,10 +728,18 @@ class MPERunner(Runner):
                 eval_infos, self.n_eval_rollout_threads
             )
             eval_dones_env = np.all(eval_dones, axis=1)
+            reset_available_actions = (
+                self._reset_available_actions_from_obs(eval_obs)
+                if np.any(eval_dones_env)
+                else None
+            )
             for agent_id in range(self.num_agents):
                 if eval_available_actions[agent_id] is None:
                     continue
-                eval_available_actions[agent_id][eval_dones_env == True] = 1.0
+                if reset_available_actions is not None:
+                    eval_available_actions[agent_id][
+                        eval_dones_env == True
+                    ] = reset_available_actions[agent_id][eval_dones_env == True]
             eval_episode_rewards.append(eval_rewards)
 
             eval_rnn_states[eval_dones == True] = np.zeros(((eval_dones == True).sum(), self.recurrent_N, self.hidden_size), dtype=np.float32)
@@ -663,9 +773,7 @@ class MPERunner(Runner):
         for episode in range(self.all_args.render_episodes):
             episode_rewards = []
             obs = self.envs.reset()
-            render_available_actions = self._default_available_actions(
-                self.n_rollout_threads
-            )
+            render_available_actions = self._reset_available_actions_from_obs(obs)
             if self.all_args.save_gifs:
                 image = self.envs.render('rgb_array')[0][0]
                 all_frames.append(image)
@@ -719,10 +827,18 @@ class MPERunner(Runner):
                     infos, self.n_rollout_threads
                 )
                 dones_env = np.all(dones, axis=1)
+                reset_available_actions = (
+                    self._reset_available_actions_from_obs(obs)
+                    if np.any(dones_env)
+                    else None
+                )
                 for agent_id in range(self.num_agents):
                     if render_available_actions[agent_id] is None:
                         continue
-                    render_available_actions[agent_id][dones_env == True] = 1.0
+                    if reset_available_actions is not None:
+                        render_available_actions[agent_id][
+                            dones_env == True
+                        ] = reset_available_actions[agent_id][dones_env == True]
                 episode_rewards.append(rewards)
 
                 rnn_states[dones == True] = np.zeros(((dones == True).sum(), self.recurrent_N, self.hidden_size), dtype=np.float32)
