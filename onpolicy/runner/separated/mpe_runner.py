@@ -683,8 +683,10 @@ class MPERunner(Runner):
         eval_rnn_states = np.zeros((self.n_eval_rollout_threads, self.num_agents, self.recurrent_N, self.hidden_size), dtype=np.float32)
         eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
 
-        # --- Track Solving Time ---
+        # --- Track Solving Time & Evaluation Costs ---
         eval_start_time = time.time()
+        # Accumulators for eval episode-level costs: [Backlog, Inventory, Maintenance, Production, Setup, TOTAL]
+        eval_accumulated_costs = np.zeros((self.n_eval_rollout_threads, 6), dtype=np.float32)
 
         for eval_step in range(self.episode_length):
             eval_temp_actions_env = []
@@ -742,26 +744,67 @@ class MPERunner(Runner):
                     ] = reset_available_actions[agent_id][eval_dones_env == True]
             eval_episode_rewards.append(eval_rewards)
 
+            # --- NEW: Accumulate Evaluation Costs ---
+            for env_idx in range(min(len(eval_infos), self.n_eval_rollout_threads)):
+                env_info = eval_infos[env_idx]
+                if len(env_info) == 0:
+                    continue
+                agent0_info = env_info[0]
+                
+                if "period_backlog_cost" in agent0_info:
+                    eval_accumulated_costs[env_idx, 0] += float(agent0_info["period_backlog_cost"])
+                if "period_inv_cost" in agent0_info:
+                    eval_accumulated_costs[env_idx, 1] += float(agent0_info["period_inv_cost"])
+                if "period_pm_cost" in agent0_info or "period_cm_cost" in agent0_info:
+                    m_cost = float(agent0_info.get("period_pm_cost", 0.0)) + \
+                             float(agent0_info.get("period_cm_cost", 0.0))
+                    eval_accumulated_costs[env_idx, 2] += m_cost
+                if "period_prod_cost" in agent0_info:
+                    eval_accumulated_costs[env_idx, 3] += float(agent0_info["period_prod_cost"])
+                if "period_setup_cost" in agent0_info:
+                    eval_accumulated_costs[env_idx, 4] += float(agent0_info["period_setup_cost"])
+                if "period_total_cost" in agent0_info:
+                    eval_accumulated_costs[env_idx, 5] += float(agent0_info["period_total_cost"])
+            # ----------------------------------------
+
             eval_rnn_states[eval_dones == True] = np.zeros(((eval_dones == True).sum(), self.recurrent_N, self.hidden_size), dtype=np.float32)
             eval_masks = np.ones((self.n_eval_rollout_threads, self.num_agents, 1), dtype=np.float32)
             eval_masks[eval_dones == True] = np.zeros(((eval_dones == True).sum(), 1), dtype=np.float32)
 
         eval_duration = time.time() - eval_start_time
         print(f"\n[EVAL] BOSCH MARL Inference Solving Time for {self.episode_length} periods: {eval_duration:.4f} seconds")
-        if self.use_wandb:
-            wandb.log({"eval_inference_seconds": eval_duration}, step=total_num_steps)
-        else:
-            self.writter.add_scalars("eval_inference_seconds", {"eval_inference_seconds": eval_duration}, total_num_steps)
-
-        eval_episode_rewards = np.array(eval_episode_rewards)
         
-        eval_train_infos = []
+        # 1. Log Inference Time directly
+        if self.use_wandb:
+            wandb.log({"Eval/inference_seconds": eval_duration}, step=total_num_steps)
+        else:
+            self.writter.add_scalar("Eval/inference_seconds", eval_duration, total_num_steps)
+
+        # 2. Log Eval Rewards
+        eval_episode_rewards = np.array(eval_episode_rewards)
         for agent_id in range(self.num_agents):
             eval_average_episode_rewards = np.mean(np.sum(eval_episode_rewards[:, :, agent_id], axis=0))
-            eval_train_infos.append({'eval_average_episode_rewards': eval_average_episode_rewards})
             print("eval average episode rewards of agent%i: " % agent_id + str(eval_average_episode_rewards))
+            if self.use_wandb:
+                wandb.log({f"Eval/average_episode_reward_agent_{agent_id}": eval_average_episode_rewards}, step=total_num_steps)
+            else:
+                self.writter.add_scalar(f"Eval/average_episode_reward_agent_{agent_id}", eval_average_episode_rewards, total_num_steps)
 
-        self.log_train(eval_train_infos, total_num_steps)  
+        # 3. Log Eval Costs (Average across the eval episodes)
+        mean_eval_costs = np.mean(eval_accumulated_costs, axis=0)
+        cost_names = ["Backlog", "Inventory", "Maintenance", "Production", "Setup", "TOTAL"]
+        
+        print("eval average episode costs: " + ", ".join([f"{name}: {cost:.2f}" for name, cost in zip(cost_names, mean_eval_costs)]))
+        
+        for i, cost_name in enumerate(cost_names):
+            if self.use_wandb:
+                wandb.log({f"Eval_Costs/{cost_name}": mean_eval_costs[i]}, step=total_num_steps)
+            else:
+                self.writter.add_scalar(f"Eval_Costs/{cost_name}", mean_eval_costs[i], total_num_steps)
+
+        # 4. Force TensorBoard to write to disk immediately
+        if not self.use_wandb and hasattr(self, 'writter') and self.writter is not None:
+            self.writter.flush()
 
     @torch.no_grad()
     def render(self):        
