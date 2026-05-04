@@ -405,7 +405,21 @@ def main(args):
     run_dir = Path("results") / all_args.env_name / all_args.algorithm_name / all_args.experiment_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    if not all_args.use_wandb:
+    if all_args.use_wandb:
+        run = wandb.init(config=all_args,
+                         project=all_args.env_name,
+                         entity=all_args.user_name,
+                         notes=socket.gethostname(),
+                         name=str(all_args.algorithm_name) + "_" +
+                         str(all_args.experiment_name) +
+                         "_seed" + str(all_args.seed),
+                         group=all_args.experiment_name,
+                         dir=str(run_dir),
+                         job_type="training",
+                         reinit=True)
+    else:
+        if not run_dir.exists():
+            run_dir.mkdir(parents=True)
         run_nums = [int(f.name.split("run")[1]) for f in run_dir.iterdir() if f.name.startswith("run")]
         curr_run = f"run{max(run_nums) + 1 if run_nums else 1}"
         run_dir = run_dir / curr_run

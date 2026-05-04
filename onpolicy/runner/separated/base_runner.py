@@ -84,8 +84,10 @@ class Runner(object):
             if not os.path.exists(self.gif_dir):
                 os.makedirs(self.gif_dir)
         else:
-            if self.use_wandb:
+            if self.use_wandb and wandb is not None and wandb.run is not None:
                 self.save_dir = str(wandb.run.dir)
+                self.run_dir = config["run_dir"]
+                self.log_dir = str(self.run_dir / 'logs')
             else:
                 self.run_dir = config["run_dir"]
                 self.log_dir = str(self.run_dir / 'logs')
