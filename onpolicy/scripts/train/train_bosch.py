@@ -158,7 +158,7 @@ def parse_args(args, parser):
         default="40.0",
         help="Per-line CM cost (comma-separated) or scalar.",
     )
-    parser.add_argument("--alpha_cost_weight", type=float, default=0.1)
+    parser.add_argument("--alpha_cost_weight", type=float, default=0.5)
     parser.add_argument(
         "--hazard_rate",
         type=str,
@@ -264,7 +264,7 @@ def parse_args(args, parser):
     parser.add_argument(
         "--dense_setup_penalty",
         type=float,
-        default=1.0,
+        default=2.0,
         help="Immediate penalty weight for setup cost during changeovers.",
     )
     parser.add_argument(

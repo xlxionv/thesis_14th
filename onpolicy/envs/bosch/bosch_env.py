@@ -17,13 +17,6 @@ from onpolicy.utils.multi_discrete import MultiDiscrete
 
 
 class BoschEnv(object):
-    """
-    Parallel-line production + maintenance environment for multi-agent RL.
-
-    Agents:
-        agent 0 : lot sizing & line allocation agent (global)
-        agents 1-N : machine agents, one per line
-    """
 
     def __init__(self, args, rank=0, is_eval=False):
         self.args = args
@@ -231,9 +224,9 @@ class BoschEnv(object):
         self.pm_cost = self._get_array_arg(cfg, "pm_cost", self.num_lines, default=15.0)
         self.cm_cost = self._get_array_arg(cfg, "cm_cost", self.num_lines, default=2.5)
         
-        self.alpha_cost_weight = float(cfg.get("alpha_cost_weight", getattr(self.args, "alpha_cost_weight", 0.1)))
+        self.alpha_cost_weight = float(cfg.get("alpha_cost_weight", getattr(self.args, "alpha_cost_weight", 0.5)))
 
-        self.machine_service_cost_share_beta = float(cfg.get("machine_service_cost_share_beta", getattr(self.args, "machine_service_cost_share_beta", 0.0)))
+        self.machine_service_cost_share_beta = float(cfg.get("machine_service_cost_share_beta", getattr(self.args, "machine_service_cost_share_beta", 0.1)))
         self.machine_service_cost_share_mode = str(cfg.get("machine_service_cost_share_mode", "assignment")).strip().lower()
         self.machine_service_cost_share_include_inventory = bool(cfg.get("machine_service_cost_share_include_inventory", False))
         self.machine_service_cost_share_include_backlog = bool(cfg.get("machine_service_cost_share_include_backlog", True))
@@ -246,7 +239,7 @@ class BoschEnv(object):
         self.cm_time = self._get_array_arg(cfg, "cm_time", self.num_lines, default=9/60)
 
         self.dense_production_reward = float(cfg.get("dense_production_reward", getattr(self.args, "dense_production_reward", 1.0)))
-        self.dense_setup_penalty = float(cfg.get("dense_setup_penalty", getattr(self.args, "dense_setup_penalty", 1.0)))
+        self.dense_setup_penalty = float(cfg.get("dense_setup_penalty", getattr(self.args, "dense_setup_penalty", 2.0)))
         self.dense_pm_penalty = float(cfg.get("dense_pm_penalty", getattr(self.args, "dense_pm_penalty", 1.0)))
         self.activation_penalty = float(cfg.get("activation_penalty", getattr(self.args, "activation_penalty", 0.0)))
 
